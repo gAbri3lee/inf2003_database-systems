@@ -1,11 +1,178 @@
-# Overview
+# HDB Resale Prices — SQL vs NoSQL Prototype
 
-This repository contains the source code, datasets, database definitions, documentation, and supporting materials for the INF2003 Database Systems group project.
+A prototype database application for INF2003. It loads the 2020–2026 HDB resale
+transactions CSV into **two** databases from one dataset:
 
-The project is a database-backed application that uses both:
+* **PostgreSQL** — a normalized relational schema (10 tables, foreign keys,
+  `CHECK` constraints, two views).
+* **MongoDB** — one collection of **embedded documents** (each transaction
+  carries its block, MRT, hawker, park and school context inline).
 
-- a relational database, for structured data, relationships, constraints, and SQL queries; and
+The Streamlit GUI does **CRUD** and **filtering** on either or both engines and
+**times every operation**, plus a benchmark tab that contrasts where each model
+wins.
 
-- a non-relational database, for data or application functions that benefit from a NoSQL data model.
+---
 
-The two databases may implement comparable functionality for evaluation, or may support different parts of the application. The final design should explain why each database and its related functions are appropriate for its assigned role.
+## 1. Requirements
+
+| Component | This machine | Notes |
+|---|---|---|
+| Python | 3.11 | `pip install -r requirements.txt` |
+| MongoDB Server | 8.x, already installed & running as a Windows service on `localhost:27017` | no auth |
+| PostgreSQL | **portable**, no install — binaries live in `vendor\pgsql`, cluster in `pgdata`, port **5433** | started by a script, no admin rights, no Windows service |
+
+Python packages: `streamlit`, `pandas`, `pymongo`, `psycopg[binary]`.
+
+```powershell
+python -m pip install --user -r requirements.txt
+```
+
+## 2. One-time setup — portable PostgreSQL
+
+The portable binaries were downloaded to `vendor\pgsql` (from EnterpriseDB).
+Initialise and start the local cluster:
+
+```powershell
+cd "<project folder>"
+powershell -ExecutionPolicy Bypass -File scripts\pg_setup.ps1
+```
+
+This runs `initdb` into `pgdata\`, sets the port to 5433, starts the server and
+creates the `hdb` database. Connection details (all defaults, override via env
+vars or `config.py`):
+
+```
+host=localhost  port=5433  user=hdb  password=hdb  dbname=hdb
+```
+
+MongoDB needs nothing — the app connects to `mongodb://localhost:27017/`,
+database `hdb`, collection `transactions`.
+
+## 3. Run the app
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run_app.ps1
+```
+
+or manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\pg_start.ps1   # if not running
+python -m streamlit run app.py
+```
+
+Streamlit opens `http://localhost:8501`.
+
+## 4. Using the GUI
+
+1. **Sidebar → ② Build & load** — point at the CSV (defaults to
+   `..\..\HDB_Compass_2020_2026_updated_data.csv`), optionally cap the row
+   count for a quick run, then **Build schema + load CSV**. Per-stage timings
+   appear on the **Overview** tab.
+2. **CRUD tab** — pick *PostgreSQL*, *MongoDB* or *Both*, then Read / Create /
+   Update / Delete a transaction. Each operation prints its millisecond time and
+   is appended to the sidebar **operation log** (downloadable as CSV).
+3. **Filter tab** — build a predicate once (town, flat type, price/area ranges,
+   month window, distance to MRT, street substring, optional geo radius), run it
+   on either engine, and see the generated **SQL** vs the **Mongo query
+   document** side by side, with timings and an optional query plan.
+4. **Benchmark tab** — repeats a fixed set of operations (point lookup, indexed
+   range scan, grouped aggregates, a 7-table join / no-join read, substring
+   search, geo radius, bulk update) N times and charts the best latency per
+   engine with a speed-up column.
+5. **Notes tab** — a written summary of the strengths and weaknesses the
+   prototype demonstrates.
+
+## 5. Data model
+
+### PostgreSQL (normalized)
+
+```
+towns(town_id PK, name UNIQUE)
+flat_models(flat_model_id PK, name UNIQUE)
+mrt_lines(line_id PK, name UNIQUE)
+mrt_stations(station_id PK, name UNIQUE, transport_type)
+station_lines(station_id FK, line_id FK)          -- MANY-TO-MANY
+hawkers(hawker_id PK, name, cooked_food_stalls)
+parks(park_id PK, name)
+schools(school_id PK, name UNIQUE)
+blocks(block_id PK, ..., town_id FK, nearest_station_id FK,
+       nearest_hawker_id FK, nearest_park_id FK, nearest_school_id FK,
+       max_floor_lvl CHECK >= 0, lat/long, dwelling-unit counts, distances)
+transactions(transaction_id PK, block_id FK, flat_model_id FK,
+             month, flat_type, storey_range,
+             floor_area_sqm CHECK > 0, resale_price CHECK > 0, ...)
+
+VIEW v_transactions_full   -- transactions joined to all 7 lookups
+VIEW v_town_month_stats    -- GROUP BY town, month
+```
+
+Relationship types present: **1-to-many** (`town→blocks`, `block→transactions`),
+**many-to-1** (`transaction→flat_model`), **many-to-many**
+(`mrt_stations↔mrt_lines`).
+
+### MongoDB (embedded)
+
+```jsonc
+// collection: transactions
+{
+  "_id": "TX_...",
+  "month": ISODate, "flat_type": "4 ROOM", "flat_model": "Model A",
+  "storey_range": "10 TO 12", "floor_area_sqm": 93.0,
+  "price_per_sqm": 5913.98, "resale_price": 550000,
+  "remaining_lease": "90 years 00 months", "remaining_lease_months": 1080,
+  "block": {
+    "block_id": "HDB_...", "block_no": "192", "street_name": "BISHAN ST 13",
+    "postal_code": "570192", "town": "BISHAN",
+    "location": { "type": "Point", "coordinates": [103.85, 1.35] },  // 2dsphere
+    "features": { "residential": true, "commercial": false, ... },
+    "dwelling": { "total_dwelling_units": 92, "sold": {...}, "rental": {...} },
+    "nearest": {
+      "mrt":    { "station": "BISHAN MRT STATION", "distance_m": 261.8,
+                  "lines": ["Red", "Orange"] },
+      "bus":    { "stop_code": "53259", "distance_m": 220.4 },
+      "hawker": { "name": "...", "distance_m": 80 },
+      "park":   { "name": "...", "distance_m": 514.7 },
+      "school": { "name": "...", "distance_m": 415.7 },
+      "cbd":    { "distance_m": 7170.7 }
+    }
+  }
+}
+```
+
+Indexes: `block.town`, `flat_type`, `flat_model`, `month`, `resale_price`,
+compound `{block.town, resale_price}`, `block.street_name`, `block.block_id`,
+`block.nearest.mrt.distance_m`, and a **`2dsphere`** index on `block.location`.
+An optional `$jsonSchema` validator enforces required fields / positive prices.
+
+## 6. Project layout
+
+```
+Project/
+├─ app.py                 Streamlit GUI (all 5 tabs)
+├─ config.py              connection strings + paths (edit here)
+├─ requirements.txt
+├─ run_app.ps1            start PG (if needed) + launch Streamlit
+├─ scripts/
+│  ├─ pg_setup.ps1        one-time initdb + createdb
+│  ├─ pg_start.ps1 / pg_stop.ps1
+├─ src/
+│  ├─ cleaning.py         CSV -> typed frame -> normalized tables / documents
+│  ├─ pg.py               PgRepo: schema, COPY load, CRUD, filter, benchmark
+│  ├─ mongo.py            MongoRepo: schema+indexes, load, CRUD, filter, benchmark
+│  ├─ loader.py           run_load(): orchestrates both, collects timings
+│  └─ timing.py           stopwatch helpers
+└─ vendor/pgsql/          portable PostgreSQL 16 binaries
+```
+
+## 7. Troubleshooting
+
+* **`PostgreSQL down`** in the sidebar → run `scripts\pg_start.ps1`. Check
+  `pgdata\server.log`.
+* **Port 5433 busy** → edit `port` in `scripts\pg_setup.ps1` and `PGPORT` /
+  `config.py`, re-run setup.
+* **`MongoDB down`** → `Get-Service MongoDB` and `Start-Service MongoDB`.
+* **Reload from scratch** → just click *Build schema + load CSV* again; both
+  sides are dropped and recreated.
+* **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.

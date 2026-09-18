@@ -1,0 +1,26 @@
+# Python-generated files and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Downloaded dependencies and generated database state
+vendor/
+pgdata/
+
+# Runtime output
+*.log
+
+# Local datasets
+*.csv
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
