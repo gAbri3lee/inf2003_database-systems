@@ -81,9 +81,11 @@ class MongoRepo:
 
     # -------------------------------------------------- schema + load ---- #
     def build_schema(self, with_validator: bool = True) -> Timing:
-        with stopwatch("build schema (drop + collection + indexes)", "mongodb") as t:
+        with stopwatch("rebuild database (drop + collection + indexes)", "mongodb") as t:
+            # A rebuild must not leave stale collections or metadata behind.
+            # The database is recreated implicitly when the collection is made.
+            self.client.drop_database(self.db_name)
             db = self.client[self.db_name]
-            db.drop_collection(self.coll_name)
             if with_validator:
                 db.create_collection(
                     self.coll_name, validator=VALIDATOR, validationLevel="moderate"

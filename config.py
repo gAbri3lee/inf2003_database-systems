@@ -8,16 +8,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+from psycopg.conninfo import make_conninfo
+
 # --- Filesystem -------------------------------------------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
+load_dotenv(PROJECT_DIR / ".env")
+
 VENDOR_DIR = PROJECT_DIR / "vendor"
 PG_BIN_DIR = VENDOR_DIR / "pgsql" / "bin"
 PG_DATA_DIR = PROJECT_DIR / "pgdata"
 
-# The source CSV.  Default: the file that ships one level above the project
-# folder.  Override with the HDB_CSV environment variable or the sidebar field
-# in the GUI.
-DEFAULT_CSV = (PROJECT_DIR.parent.parent / "HDB_Compass_2020_2026_updated_data.csv")
+# The trimmed source CSV ships in the project folder. Override with the
+# HDB_CSV environment variable or the sidebar field in the GUI.
+DEFAULT_CSV = PROJECT_DIR / "HDB_Compass_trimmed_updated.csv"
 CSV_PATH = Path(os.environ.get("HDB_CSV", DEFAULT_CSV))
 
 # --- PostgreSQL -----------------------------------------------------------
@@ -29,9 +33,12 @@ PG_DB = os.environ.get("PGDATABASE", "hdb")
 PG_SUPERUSER_DB = "postgres"  # bootstrap db that always exists after initdb
 
 def pg_dsn(dbname: str | None = None) -> str:
-    return (
-        f"host={PG_HOST} port={PG_PORT} user={PG_USER} "
-        f"password={PG_PASSWORD} dbname={dbname or PG_DB}"
+    return make_conninfo(
+        host=PG_HOST,
+        port=PG_PORT,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        dbname=dbname or PG_DB,
     )
 
 # --- MongoDB -------------------------------------------------------------

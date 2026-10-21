@@ -90,6 +90,37 @@ FLOAT_COLS = ["floor_area_sqm", "latitude", "longitude", "distance_to_mrt_m",
               "bus_distance_m", "hawker_distance_m", "park_distance_m",
               "distance_to_cbd_m", "distance_to_pri_school_m"]
 
+# Columns used by the database projections but omitted from the trimmed CSV.
+# Nullable attributes are added as missing values below. Identifiers and the
+# human-readable address are derived deterministically from retained columns.
+OPTIONAL_DEFAULTS = {
+    "property_address": None,
+    "bldg_contract_town": None,
+    "latitude": None,
+    "longitude": None,
+    "residential": None,
+    "market_hawker": None,
+    "miscellaneous": None,
+    "multistorey_carpark": None,
+    "precinct_pavilion": None,
+    "total_dwelling_units": None,
+    "mrt_exit_code": None,
+    "bus_stop_code": None,
+    "hawker_cooked_food_stalls": None,
+    **{c: None for c in SOLD_COLS},
+    **{c: None for c in RENTAL_COLS},
+}
+
+REQUIRED_INPUT_COLS = {
+    "month", "town", "flat_type", "block_no", "street_name",
+    "storey_range", "floor_area_sqm", "price_per_sqm", "flat_model",
+    "lease_commence_year", "remaining_lease", "resale_price",
+    "postal_code", "mrt_station", "distance_to_mrt_m", "transport_type",
+    "line_color", "bus_distance_m", "hawker_name", "hawker_distance_m",
+    "park_name", "park_distance_m", "distance_to_cbd_m", "pri_school",
+    "distance_to_pri_school_m",
+}
+
 _LEASE_RE = re.compile(r"(?:(\d+)\s*years?)?\s*(?:(\d+)\s*months?)?", re.I)
 
 
@@ -116,6 +147,58 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
     )
     df.columns = [c.strip() for c in df.columns]
     df = df.rename(columns=RENAME)
+
+    missing_required = sorted(REQUIRED_INPUT_COLS - set(df.columns))
+    if missing_required:
+        raise ValueError(
+            "CSV is missing required columns: " + ", ".join(missing_required)
+        )
+
+    # The trimmed dataset intentionally omits several block attributes. Keep
+    # the SQL and Mongo projections structurally compatible by making those
+    # attributes nullable instead of requiring separate loader implementations.
+    for col, default in OPTIONAL_DEFAULTS.items():
+        if col not in df.columns:
+            df[col] = default
+
+    if df["property_address"].isna().all():
+        df["property_address"] = (
+            df["block_no"].fillna("").str.strip() + " "
+            + df["street_name"].fillna("").str.strip()
+        ).str.strip()
+
+    # Stable surrogate IDs replace the source IDs removed by the trimmed CSV.
+    # Block IDs are shared by all transactions at the same retained address.
+    if "block_id" not in df.columns:
+        block_keys = df[["town", "block_no", "street_name", "postal_code"]].fillna("")
+        block_hash = pd.util.hash_pandas_object(block_keys, index=False)
+        df["block_id"] = block_hash.map(lambda v: f"BLK_{int(v):016x}")
+
+    if "hawker_id" not in df.columns:
+        hawker_hash = pd.util.hash_pandas_object(df["hawker_name"].fillna(""), index=False)
+        df["hawker_id"] = [
+            None if pd.isna(name) or not str(name).strip() else f"HWK_{int(value):016x}"
+            for name, value in zip(df["hawker_name"], hawker_hash)
+        ]
+
+    if "park_id" not in df.columns:
+        park_hash = pd.util.hash_pandas_object(df["park_name"].fillna(""), index=False)
+        df["park_id"] = [
+            None if pd.isna(name) or not str(name).strip() else f"PRK_{int(value):016x}"
+            for name, value in zip(df["park_name"], park_hash)
+        ]
+
+    if "transaction_id" not in df.columns:
+        id_cols = [
+            "month", "town", "block_no", "street_name", "flat_type",
+            "storey_range", "floor_area_sqm", "flat_model", "resale_price",
+        ]
+        txn_hash = pd.util.hash_pandas_object(df[id_cols].fillna(""), index=False)
+        duplicate_no = txn_hash.groupby(txn_hash).cumcount() + 1
+        df["transaction_id"] = [
+            f"TX_{int(value):016x}_{int(sequence):03d}"
+            for value, sequence in zip(txn_hash, duplicate_no)
+        ]
 
     for col in df.columns:
         if df[col].dtype == object:
@@ -302,6 +385,29 @@ def _clean(v):
     return v
 
 
+def _without_missing(value):
+    """Remove absent fields and containers from a MongoDB document.
+
+    The trimmed CSV intentionally excludes several columns needed by the SQL
+    projection. They are added to the shared dataframe as nulls, but MongoDB
+    should not persist those synthetic null fields.
+    """
+    if isinstance(value, dict):
+        cleaned = {
+            key: _without_missing(item)
+            for key, item in value.items()
+            if item is not None
+        }
+        return {
+            key: item
+            for key, item in cleaned.items()
+            if item is not None and item != {} and item != []
+        }
+    if isinstance(value, list):
+        return [_without_missing(item) for item in value if item is not None]
+    return value
+
+
 def iter_mongo_docs(df: pd.DataFrame):
     """Yield one embedded document per transaction for the MongoDB collection."""
     for r in df.itertuples(index=False):
@@ -379,4 +485,4 @@ def iter_mongo_docs(df: pd.DataFrame):
                 },
             },
         }
-        yield doc
+        yield _without_missing(doc)
