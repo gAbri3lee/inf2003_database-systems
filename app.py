@@ -14,15 +14,19 @@ Run with:  ``streamlit run app.py``
 from __future__ import annotations
 
 import datetime as dt
+import html
 import json
 import os
 import sys
 import uuid
+from pathlib import Path
 
 # make sure "config" / "src" resolve no matter how streamlit is launched
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import altair as alt
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 
 import config
@@ -33,7 +37,19 @@ from src.pg import SCORE_FACTORS, PgRepo
 from src.prefs import PrefsRepo
 from src.timing import Timing
 
-st.set_page_config(page_title="HDB SQL vs NoSQL", layout="wide", page_icon="🏙️")
+APP_NAME = "HomeWise SG"
+st.set_page_config(page_title=f"{APP_NAME} · HDB resale explorer",
+                   layout="wide", page_icon="🏠")
+# colours/fonts for built-in widgets are in .streamlit/config.toml; st.html
+# wraps a .css Path in <style> itself
+st.html(Path(__file__).parent / "assets" / "style.css")
+
+# Chart colours. Keep in sync with .hw-eng.* in assets/style.css and
+# chartCategoricalColors in .streamlit/config.toml.
+BRAND = "#0F766E"
+ACCENT = "#F97316"                     # the selected flat on the map
+ENGINE_COLORS = {"PostgreSQL": "#2563EB", "MongoDB": "#16A34A"}
+LABEL_GREY = "#334155"                 # value labels on bar charts
 
 
 # --------------------------------------------------------------------------- #
@@ -100,9 +116,31 @@ def record(*timings: Timing):
             st.session_state.log.append(t)
 
 
+ENGINE_NAMES = {"postgres": "PostgreSQL", "mongodb": "MongoDB", "shared": "Shared"}
+
+
 def show_timing(t: Timing, prefix: str = ""):
-    rows = f" · {t.rows} row(s)" if t.rows is not None else ""
-    st.success(f"{prefix}**{t.engine}** — {t.label}: **{t.ms:.2f} ms**{rows}")
+    rows = f" · {t.rows:,} row(s)" if t.rows is not None else ""
+    engine = html.escape(t.engine)
+    st.html(f'<div class="hw-timing"><span class="hw-eng {engine}">'
+            f'{ENGINE_NAMES.get(t.engine, engine)}</span>'
+            f'{html.escape(prefix + t.label)} · <b>{t.ms:,.1f} ms</b>{rows}</div>')
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _cached_summary():
+    # Raises if PostgreSQL is unreachable: st.cache_data doesn't cache
+    # exceptions, so the banner recovers as soon as the database is back.
+    row, _ = pg.summary()
+    return row if row["n"] else None
+
+
+def site_stats():
+    """Headline numbers for the banner (None if PostgreSQL is down or empty)."""
+    try:
+        return _cached_summary()
+    except Exception:
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -216,6 +254,116 @@ def _ff_summary(f: dict) -> str:
     return " · ".join(parts)
 
 
+def _ff_card(rank: int, r: pd.Series) -> str:
+    """HTML for one top-result card (styled by .hw-card in assets/style.css)."""
+    def metres(v):
+        return "n/a" if pd.isna(v) else f"{v:,.0f} m"
+
+    station = (str(r["nearest_mrt"]).title().replace(" Mrt Station", "")
+               .replace(" Lrt Station", " LRT") if pd.notna(r.get("nearest_mrt")) else "")
+    facts = [f"MRT {metres(r['distance_to_mrt_m'])}" + (f" · {station}" if station else ""),
+             f"School {metres(r['distance_to_pri_school_m'])}",
+             f"{r['floor_area_sqm']:.0f} sqm"]
+    if pd.notna(r.get("remaining_lease_months")):
+        facts.append(f"{int(r['remaining_lease_months']) // 12} yrs lease")
+    e = html.escape
+    return (
+        '<div class="hw-card">'
+        f'<div class="hw-card-top"><span class="hw-rank">#{rank}</span>'
+        f'<span class="hw-score">{r["score"]:.0f}<small> /100</small></span></div>'
+        f'<div class="hw-bar"><div style="width:{r["score"]:.0f}%"></div></div>'
+        f'<div class="hw-addr">Blk {e(str(r["block_no"]))} {e(str(r["street_name"]).title())}</div>'
+        f'<div class="hw-sub">{e(str(r["town"]).title())} · {e(str(r["flat_type"]))} · '
+        f'storey {e(str(r["storey_range"]))} · sold {pd.Timestamp(r["month"]):%b %Y}</div>'
+        f'<div class="hw-price">${r["resale_price"]:,.0f}</div>'
+        '<div class="hw-facts">' + "".join(f"<span>{e(f)}</span>" for f in facts) + "</div>"
+        "</div>"
+    )
+
+
+def _ff_contrib_chart(r: pd.Series, weights: dict, active: list[str]) -> alt.Chart:
+    """Horizontal bars, largest contribution first, labelled with the points."""
+    total = sum(weights.values())
+    data = pd.DataFrame({
+        "factor": [FACTORS[k][0] for k in active],
+        "points": [r[f"s_{k}"] * weights[k] / total for k in active],
+    })
+    base = alt.Chart(data).encode(
+        y=alt.Y("factor:N", sort="-x", title=None,
+                axis=alt.Axis(ticks=False, domain=False, labelFontSize=13, labelPadding=8)),
+        x=alt.X("points:Q", title="points added to the score",
+                axis=alt.Axis(grid=False, tickCount=4)),
+        tooltip=["factor", alt.Tooltip("points:Q", format=".1f")],
+    )
+    bars = base.mark_bar(color=BRAND, cornerRadiusEnd=5, size=20)
+    labels = base.mark_text(align="left", dx=5, color=LABEL_GREY, fontSize=12,
+                            fontWeight=600).encode(text=alt.Text("points:Q", format=".1f"))
+    return (bars + labels).properties(height=34 * len(active) + 30)
+
+
+def _rgba(hex_colour: str, alpha: int = 255) -> list[int]:
+    h = hex_colour.lstrip("#")
+    return [int(h[i:i + 2], 16) for i in (0, 2, 4)] + [alpha]
+
+
+SINGAPORE_VIEW = pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=10.3)
+
+
+def _ff_map(df: pd.DataFrame, selected: int) -> pdk.Deck:
+    """Results map zoomed to fit the matches; dots stay the same size on screen."""
+    pts = df.dropna(subset=["latitude", "longitude"])
+    pts = pd.DataFrame({
+        "lon": pts["longitude"], "lat": pts["latitude"],
+        "score": pts["score"].round(0),
+        # the tooltip is rendered as HTML, so escape text that came from the data
+        "label": ("Blk " + pts["block_no"].astype(str) + " "
+                  + pts["street_name"].astype(str).str.title()).map(html.escape),
+        "price": pts["resale_price"].map("${:,.0f}".format),
+        "is_sel": pts.index == selected,
+    })
+    pts["fill"] = [_rgba(ACCENT) if s else _rgba(BRAND, 200) for s in pts["is_sel"]]
+    pts["radius"] = [11 if s else 6 for s in pts["is_sel"]]
+    pts = pts.sort_values("is_sel")              # draw the selected flat last (on top)
+    layer = pdk.Layer(
+        "ScatterplotLayer", data=pts.drop(columns="is_sel"),
+        get_position="[lon, lat]", get_fill_color="fill", get_radius="radius",
+        # pydeck turns bare strings into JS expressions, so quote the literal
+        radius_units="'pixels'", stroked=True, get_line_color=[255, 255, 255],
+        line_width_min_pixels=1.5, pickable=True,
+    )
+    if pts.empty:                                # compute_view() fails on no points
+        view = SINGAPORE_VIEW
+    else:
+        view = pdk.data_utils.compute_view(pts[["lon", "lat"]].values.tolist(),
+                                           view_proportion=1)
+        view.zoom = min(view.zoom, 14)
+    return pdk.Deck(layers=[layer], initial_view_state=view, map_style="light",
+                    tooltip={"html": "<b>{label}</b><br/>Score {score} · {price}"})
+
+
+def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
+    """Grouped horizontal bars per operation. symlog (not log: bars start at 0,
+    which log can't draw) so 0.2 ms and 3 s both stay readable."""
+    data = bf.assign(engine=bf["engine"].map(ENGINE_NAMES).fillna(bf["engine"]))
+    base = alt.Chart(data).encode(
+        y=alt.Y("operation:N", title=None, sort=None,
+                axis=alt.Axis(labelLimit=320, labelFontSize=13, ticks=False, domain=False)),
+        yOffset=alt.YOffset("engine:N", sort=["PostgreSQL", "MongoDB"]),
+        x=alt.X("ms:Q", scale=alt.Scale(type="symlog"),
+                title="best time in ms (log-style scale)",
+                axis=alt.Axis(grid=True, values=[0, 1, 10, 100, 1000, 10000])),
+        color=alt.Color("engine:N",
+                        scale=alt.Scale(domain=list(ENGINE_COLORS),
+                                        range=list(ENGINE_COLORS.values())),
+                        legend=alt.Legend(orient="top", title=None, labelFontSize=13)),
+        tooltip=["operation", "engine", alt.Tooltip("ms:Q", format=",.2f"), "rows", "how"],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=3, size=13)
+    labels = base.mark_text(align="left", dx=4, fontSize=11, color=LABEL_GREY).encode(
+        text=alt.Text("ms:Q", format=",.1f"))
+    return (bars + labels).properties(height=46 * data["operation"].nunique() + 20)
+
+
 def _local_time(t: dt.datetime) -> str:
     """MongoDB hands back naive UTC datetimes; show them in local time."""
     return t.replace(tzinfo=dt.timezone.utc).astimezone().strftime("%d %b %H:%M")
@@ -224,68 +372,98 @@ def _local_time(t: dt.datetime) -> str:
 # --------------------------------------------------------------------------- #
 #  Sidebar: connections + load                                               #
 # --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("① Connections")
+def _status_row(name: str, ping) -> bool:
+    """One sidebar line per database: name, version and a status badge."""
     try:
-        st.caption("PostgreSQL"); st.code(pg.ping()[:60] + " …", language=None)
-        pg_ok = True
+        detail, ok = ping(), True
     except Exception as e:
-        st.error(f"PostgreSQL down: {e}"); pg_ok = False
-    try:
-        st.caption("MongoDB"); st.code(mongo.ping(), language=None)
-        mongo_ok = True
-    except Exception as e:
-        st.error(f"MongoDB down: {e}"); mongo_ok = False
-
-    st.header("② Build & load")
-    csv_path = st.text_input("CSV path", value=str(config.CSV_PATH))
-    limit = st.number_input(
-        "Row limit (0 = all ≈ 171k)", min_value=0, max_value=2_000_000,
-        value=0, step=5000,
-    )
-    c1, c2 = st.columns(2)
-    load_pg = c1.checkbox("PostgreSQL", value=True, disabled=not pg_ok)
-    load_mongo = c2.checkbox("MongoDB", value=True, disabled=not mongo_ok)
-    validator = st.checkbox("MongoDB $jsonSchema validator", value=True)
-
-    if st.button("🚀 Build schema + load CSV", type="primary",
-                 disabled=not (load_pg or load_mongo)):
-        with st.spinner("Loading… (first full run ≈ 1–2 min)"):
-            rep = run_load(
-                csv_path, pg, mongo,
-                limit=None if limit == 0 else int(limit),
-                do_pg=load_pg, do_mongo=load_mongo, mongo_validator=validator,
-            )
-        st.session_state.report = rep
-        record(*rep.timings)
-        pg_distinct.clear(); mongo_distinct.clear()
-        st.success(
-            f"Loaded {rep.rows_loaded:,} rows "
-            f"(dropped {rep.dropped_invalid} invalid). "
-            f"PG {rep.total_ms('postgres')/1000:.1f}s · "
-            f"Mongo {rep.total_ms('mongodb')/1000:.1f}s"
-        )
-
-    st.header("③ Operation log")
-    if st.session_state.log:
-        log_df = pd.DataFrame(
-            [(t.engine, t.label, round(t.ms, 2), t.rows) for t in st.session_state.log],
-            columns=["engine", "operation", "ms", "rows"],
-        )
-        st.dataframe(log_df, height=210, width="stretch")
-        st.download_button("Download log CSV", log_df.to_csv(index=False),
-                           "timing_log.csv", "text/csv")
-        if st.button("Clear log"):
-            st.session_state.log = []; st.rerun()
+        detail, ok = str(e), False
+    c_name, c_badge = st.columns([3, 2], vertical_alignment="center")
+    c_name.markdown(f"**{name}**")
+    if ok:
+        c_badge.badge("Online", icon=":material/check_circle:", color="green")
+        # "PostgreSQL 16.4, compiled by ..." / "MongoDB 9.0.4" -> name + version
+        st.caption(" ".join(detail.split()[:2]).rstrip(","))
     else:
-        st.caption("Nothing yet — run an operation.")
+        c_badge.badge("Offline", icon=":material/error:", color="red")
+        st.caption(f"{detail[:140]}")
+    return ok
+
+
+with st.sidebar:
+    st.markdown(f"### 🏠 {APP_NAME}")
+    st.caption("Control panel")
+
+    st.markdown("##### :material/database: Databases")
+    pg_ok = _status_row("PostgreSQL", pg.ping)
+    mongo_ok = _status_row("MongoDB", mongo.ping)
+
+    with st.expander(":material/upload_file: Load data", expanded=site_stats() is None):
+        csv_path = st.text_input("CSV path", value=str(config.CSV_PATH))
+        limit = st.number_input(
+            "Row limit (0 = all ≈ 171k)", min_value=0, max_value=2_000_000,
+            value=0, step=5000,
+        )
+        c1, c2 = st.columns(2)
+        load_pg = c1.checkbox("PostgreSQL", value=True, disabled=not pg_ok)
+        load_mongo = c2.checkbox("MongoDB", value=True, disabled=not mongo_ok)
+        validator = st.checkbox("MongoDB $jsonSchema validator", value=True)
+
+        if st.button("Build schema + load CSV", type="primary", icon=":material/rocket_launch:",
+                     disabled=not (load_pg or load_mongo), width="stretch"):
+            with st.spinner("Loading… (first full run ≈ 1–2 min)"):
+                rep = run_load(
+                    csv_path, pg, mongo,
+                    limit=None if limit == 0 else int(limit),
+                    do_pg=load_pg, do_mongo=load_mongo, mongo_validator=validator,
+                )
+            st.session_state.report = rep
+            record(*rep.timings)
+            pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
+            st.success(
+                f"Loaded {rep.rows_loaded:,} rows "
+                f"(dropped {rep.dropped_invalid} invalid). "
+                f"PG {rep.total_ms('postgres')/1000:.1f}s · "
+                f"Mongo {rep.total_ms('mongodb')/1000:.1f}s"
+            )
+
+    # Filled at the very end of the script (see bottom of file), after the tabs
+    # have recorded this run's timings; otherwise the log lags one action behind.
+    log_slot = st.container()
+
+    st.caption("INF2003 Database Systems · Team 41")
+
+
+# --------------------------------------------------------------------------- #
+#  Hero banner                                                               #
+# --------------------------------------------------------------------------- #
+_stats = site_stats()
+_chips = []
+if _stats:
+    _chips = [f"<b>{_stats['n']:,}</b> resale sales",
+              f"<b>{_stats['towns']}</b> towns",
+              f"<b>{_stats['blocks']:,}</b> blocks",
+              f"<b>{_stats['lo']:%b %Y} – {_stats['hi']:%b %Y}</b>",
+              "PostgreSQL <b>+</b> MongoDB"]
+_first, _, _last = APP_NAME.rpartition(" ")
+st.html(
+    '<div class="hw-hero">'
+    f'<div class="hw-brand">{html.escape(_first)} <span>{html.escape(_last)}</span></div>'
+    '<div class="hw-tagline">Find the HDB resale flat that fits your life. Rank real '
+    'sales by price, transport, schools, food and green space, and see exactly why '
+    'each one scores the way it does.</div>'
+    '<div class="hw-stats">' + "".join(f'<div class="hw-stat">{c}</div>' for c in _chips)
+    + "</div></div>"
+)
 
 
 # --------------------------------------------------------------------------- #
 #  Main tabs                                                                  #
 # --------------------------------------------------------------------------- #
 tab_find, tab_overview, tab_crud, tab_filter, tab_bench, tab_notes = st.tabs(
-    ["🏠 Find a flat", "📋 Overview", "✏️ CRUD", "🔎 Filter", "⏱️ Benchmark", "🧠 Notes"]
+    [":material/home: Find a flat", ":material/dashboard: Overview",
+     ":material/edit_note: CRUD", ":material/filter_alt: Filter",
+     ":material/speed: Benchmark", ":material/lightbulb: Notes"]
 )
 
 # -------------------------------------------------------------- Find a flat -- #
@@ -317,7 +495,7 @@ with tab_find:
     profile_opts = ["(guest)"] + (prefs.profiles() if use_prefs else [])
     if ss.get("ff_profile") not in profile_opts:
         ss.ff_profile = "(guest)"
-    pc1, pc2, pc3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+    pc1, pc2, pc3 = st.container(border=True).columns([2, 2, 1], vertical_alignment="bottom")
     profile = pc1.selectbox("Profile (stored in MongoDB)", profile_opts,
                             key="ff_profile", disabled=not use_prefs)
     new_name = pc2.text_input("New profile name", key="ff_new_profile",
@@ -346,32 +524,38 @@ with tab_find:
             st.rerun()
 
     # ---- filters + priorities ------------------------------------------ #
-    st.markdown("##### What are you looking for?")
-    c1, c2 = st.columns(2)
-    c1.multiselect("Towns (leave empty for anywhere)", town_opts, key="ff_towns")
-    c2.multiselect("Flat types (leave empty for any)", type_opts, key="ff_types")
-    c3, c4, c5, c6 = st.columns(4)
-    c3.slider("Max budget (SGD)", 200_000, 2_000_000, step=10_000, key="ff_budget")
-    c4.number_input("Min floor area (sqm)", 0, 300, step=5, key="ff_area")
-    c5.slider("Min lease left (years)", 0, 95, step=5, key="ff_lease")
-    c6.selectbox("Compare against sales from", MONTH_OPTS, key="ff_months",
-                 format_func=lambda m: f"the last {m} months" if m else "all years (2020–2026)")
-    st.checkbox("One result per block (its best-scoring sale)", key="ff_one_per_block")
+    left_panel, right_panel = st.columns([5, 6])
+    with left_panel.container(border=True, height="stretch"):
+        st.markdown("##### :material/search: What are you looking for?")
+        st.multiselect("Towns", town_opts, key="ff_towns", placeholder="Anywhere in Singapore")
+        st.multiselect("Flat types", type_opts, key="ff_types", placeholder="Any flat type")
+        st.slider("Max budget (SGD)", 200_000, 2_000_000, step=10_000, key="ff_budget",
+                  format="localized")
+        c4, c5 = st.columns(2)
+        c4.number_input("Min floor area (sqm)", 0, 300, step=5, key="ff_area")
+        c5.slider("Min lease left (years)", 0, 95, step=5, key="ff_lease")
+        st.selectbox("Compare against sales from", MONTH_OPTS, key="ff_months",
+                     format_func=lambda m: f"The last {m} months" if m else "All years (2020–2026)")
+        st.toggle("One result per block (its best-scoring sale)", key="ff_one_per_block")
 
-    st.markdown("##### What matters to you? (0 = don't care)")
-    factor_keys = list(FACTORS)
-    for row_keys in (factor_keys[:4], factor_keys[4:]):
-        for col, k in zip(st.columns(4), row_keys):
-            col.slider(FACTORS[k][0], 0, 100, step=5, key=f"ff_w_{k}")
+    with right_panel.container(border=True, height="stretch"):
+        st.markdown("##### :material/tune: What matters to you?")
+        st.caption("Drag each slider: 0 = don't care, 100 = essential.")
+        factor_keys = list(FACTORS)
+        for i in range(0, len(factor_keys), 2):
+            for col, k in zip(st.columns(2), factor_keys[i:i + 2]):
+                col.slider(FACTORS[k][0], 0, 100, step=5, key=f"ff_w_{k}")
 
-    b1, b2, b3, b4 = st.columns([1, 1.2, 1.8, 1], vertical_alignment="bottom")
-    find = b1.button("🔎 Find flats", type="primary", key="ff_find",
-                     disabled=not (pg_ok and town_opts))
+    b1, b2, b3, b4 = st.columns([1.2, 1.3, 2, 1], vertical_alignment="bottom")
+    find = b1.button("Find flats", type="primary", key="ff_find", icon=":material/travel_explore:",
+                     disabled=not (pg_ok and town_opts), width="stretch")
     save_defaults = b2.button("Save as my defaults", key="ff_save_profile",
-                              disabled=user is None)
+                              icon=":material/bookmark:", disabled=user is None,
+                              width="stretch")
     search_name = b3.text_input("Search name", key="ff_search_name",
                                 placeholder="e.g. Near my parents", disabled=user is None)
-    save_search = b4.button("Save search", key="ff_save_search", disabled=user is None)
+    save_search = b4.button("Save search", key="ff_save_search", icon=":material/star:",
+                            disabled=user is None, width="stretch")
     if use_prefs and user is None:
         st.caption("Pick or create a profile to save your preferences and searches.")
 
@@ -411,122 +595,133 @@ with tab_find:
     res = ss.get("ff_result")
     if res:
         df, weights = res["df"], res["weights"]
+        st.markdown("### Your best matches")
         show_timing(res["timing"])
         if df.empty:
             st.info("No flats match those filters. Try a higher budget, more towns "
                     "or a longer time window.")
         else:
-            total = sum(weights.values())
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Matches shown", len(df))
-            m2.metric("Best score", f"{df['score'].iloc[0]:.0f} / 100")
-            m3.metric("Compared against", f"{int(df['pool_size'].iloc[0]):,} sales")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Matches shown", len(df), border=True)
+            m2.metric("Best score", f"{df['score'].iloc[0]:.0f} / 100", border=True)
+            m3.metric("Median price", f"${df['resale_price'].median():,.0f}", border=True)
+            m4.metric("Sales compared against", f"{int(df['pool_size'].iloc[0]):,}",
+                      border=True)
 
-            left, right = st.columns([3, 2])
-            with left:
-                event = st.dataframe(
-                    df[["score", "town", "block_no", "street_name", "flat_type",
-                        "storey_range", "floor_area_sqm", "resale_price", "month",
-                        "remaining_lease"]],
-                    hide_index=True, width="stretch", height=420, key="ff_table",
-                    on_select="rerun", selection_mode="single-row",
-                    column_config={
-                        "score": st.column_config.ProgressColumn(
-                            "Score", min_value=0, max_value=100, format="%.0f"),
-                        "town": "Town", "block_no": "Block", "street_name": "Street",
-                        "flat_type": "Type", "storey_range": "Storey",
-                        "floor_area_sqm": st.column_config.NumberColumn("sqm", format="%d"),
-                        "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
-                        "month": st.column_config.DateColumn("Sold", format="MMM YYYY"),
-                        "remaining_lease": "Lease left",
-                    },
-                )
-                st.caption("Click a row to see why it scored the way it did.")
+            for i, col in zip(range(min(3, len(df))), st.columns(3)):
+                col.html(_ff_card(i + 1, df.iloc[i]))
+
+            st.markdown("#### All matches")
+            st.caption("Click a row to see why it scored the way it did.")
+            event = st.dataframe(
+                df[["score", "town", "block_no", "street_name", "flat_type",
+                    "storey_range", "floor_area_sqm", "resale_price", "month",
+                    "remaining_lease"]],
+                hide_index=True, width="stretch", height=390, key="ff_table",
+                on_select="rerun", selection_mode="single-row",
+                column_config={
+                    "score": st.column_config.ProgressColumn(
+                        "Score", min_value=0, max_value=100, format="%.0f"),
+                    "town": "Town", "block_no": "Block", "street_name": "Street",
+                    "flat_type": "Type", "storey_range": "Storey",
+                    "floor_area_sqm": st.column_config.NumberColumn("Size (sqm)", format="%d"),
+                    "resale_price": st.column_config.NumberColumn("Price (SGD)",
+                                                                  format="localized"),
+                    "month": st.column_config.DateColumn("Sold", format="MMM YYYY"),
+                    "remaining_lease": "Lease left",
+                },
+            )
             picked = event.selection.rows
             idx = picked[0] if picked and picked[0] < len(df) else 0
-            with right:
-                pts = df.dropna(subset=["latitude", "longitude"]).copy()
-                pts["colour"] = "#4c78a8"
-                pts["size"] = 40
-                pts.loc[pts.index == idx, ["colour", "size"]] = ["#e4572e", 110]
-                st.map(pts, latitude="latitude", longitude="longitude",
-                       color="colour", size="size")
-
             r = df.iloc[idx]
-            st.markdown(f"#### #{idx + 1} · Blk {r['block_no']} {r['street_name']}, "
-                        f"{r['town']}: **{r['score']:.0f} / 100**")
-            st.caption(f"{r['flat_type']} · storey {r['storey_range']} · "
-                       f"{r['floor_area_sqm']:.0f} sqm · sold "
-                       f"{pd.Timestamp(r['month']):%b %Y} for ${r['resale_price']:,.0f}")
-            active = [k for k in FACTORS if weights.get(k, 0) > 0]
-            bd1, bd2 = st.columns([2, 3])
-            contrib = pd.DataFrame(
-                {"points": [r[f"s_{k}"] * weights[k] / total for k in active]},
-                index=[FACTORS[k][0] for k in active])
-            bd1.bar_chart(contrib, horizontal=True, height=260)
-            bd1.caption("Each bar is sub-score × your weight ÷ total weight, "
-                        "so the bars add up to the score.")
-            bd2.markdown("\n".join(f"- {_ff_explain(k, r)} (weight {weights[k]})"
-                                   for k in active))
-            ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
-            if ignored:
-                bd2.caption("Not counted (weight 0): " + ", ".join(ignored))
-            with st.expander("Show the SQL behind this ranking"):
+
+            why, where = st.columns([3, 2])
+            with why.container(border=True, height="stretch"):
+                st.markdown(f"#### :material/insights: Why #{idx + 1} scored "
+                            f"{r['score']:.0f} / 100")
+                st.caption(f"Blk {r['block_no']} {str(r['street_name']).title()}, "
+                           f"{str(r['town']).title()} · {r['flat_type']} · storey "
+                           f"{r['storey_range']} · {r['floor_area_sqm']:.0f} sqm · sold "
+                           f"{pd.Timestamp(r['month']):%b %Y} for ${r['resale_price']:,.0f}")
+                active = [k for k in FACTORS if weights.get(k, 0) > 0]
+                st.altair_chart(_ff_contrib_chart(r, weights, active), width="stretch")
+                st.caption("Each bar is sub-score × your weight ÷ total weight, "
+                           "so the bars add up to the score.")
+                st.markdown("\n".join(f"- {_ff_explain(k, r)} (weight {weights[k]})"
+                                      for k in active))
+                ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
+                if ignored:
+                    st.caption("Not counted (weight 0): " + ", ".join(ignored))
+            with where.container(border=True, height="stretch"):
+                st.markdown("#### :material/map: Where they are")
+                st.pydeck_chart(_ff_map(df, idx), height=520)
+                st.caption(":orange[**●**] selected flat · :green[**●**] other matches · "
+                           "hover a dot for details")
+            with st.expander("Show the SQL behind this ranking", icon=":material/code:"):
                 st.code(res["sql"], language="sql")
 
     # ---- saved searches + history (MongoDB) ---------------------------- #
     if user:
-        st.divider()
+        st.markdown(f"### {user}'s searches")
         h1, h2 = st.columns(2)
-        with h1:
-            st.markdown("##### ⭐ Saved searches")
+        with h1.container(border=True, height="stretch"):
+            st.markdown("##### :material/star: Saved searches")
             saved = prefs.saved_searches(user)
             if not saved:
                 st.caption("None yet: set up a search, name it and click **Save search**.")
             for s in saved:
                 sc1, sc2, sc3 = st.columns([4, 1, 1], vertical_alignment="center")
-                sc1.markdown(f"**{s['name']}**  \n{_ff_summary(s['filters'])}")
-                if sc2.button("Load", key=f"ff_load_{s['_id']}"):
+                sc1.markdown(f"**{s['name']}**  \n:gray[{_ff_summary(s['filters'])}]")
+                if sc2.button("Load", key=f"ff_load_{s['_id']}", icon=":material/restore:",
+                              type="tertiary"):
                     ss.ff_pending = s
                     st.rerun()
-                if sc3.button("Delete", key=f"ff_del_{s['_id']}"):
+                if sc3.button("Delete", key=f"ff_del_{s['_id']}", icon=":material/delete:",
+                              type="tertiary"):
                     record(prefs.delete_search(s["_id"]))
                     st.rerun()
-        with h2:
-            st.markdown("##### 🕘 Recent searches")
+        with h2.container(border=True, height="stretch"):
+            st.markdown("##### :material/history: Recent searches")
             history = prefs.recent_history(user, 5)
             if not history:
                 st.caption("Your searches will appear here.")
             for h in history:
                 hc1, hc2 = st.columns([5, 1], vertical_alignment="center")
-                hc1.markdown(f"{_local_time(h['searched_at'])} · "
-                             f"{h.get('result_count', 0)} results  \n{_ff_summary(h['filters'])}")
-                if hc2.button("Load", key=f"ff_hist_{h['_id']}"):
+                hc1.markdown(f"**{_local_time(h['searched_at'])}** · "
+                             f"{h.get('result_count', 0)} results  \n"
+                             f":gray[{_ff_summary(h['filters'])}]")
+                if hc2.button("Load", key=f"ff_hist_{h['_id']}", icon=":material/restore:",
+                              type="tertiary"):
                     ss.ff_pending = h
                     st.rerun()
 
-        if st.button("📊 Analyse my search history", key="ff_insights"):
+        if st.button("Analyse my search history", key="ff_insights",
+                     icon=":material/query_stats:"):
             insights, t = prefs.insights(user)
             record(t)
             ss.ff_insights_data = (user, insights)
         if ss.get("ff_insights_data") and ss.ff_insights_data[0] == user:
             insights = ss.ff_insights_data[1]
-            i1, i2 = st.columns(2)
-            towns_df = pd.DataFrame(insights["towns"])
-            if towns_df.empty:
-                i1.caption("No town filters in your history yet.")
-            else:
-                i1.markdown("**Towns you search most**")
-                i1.bar_chart(towns_df.set_index("_id")["searches"], horizontal=True)
-            if insights["avg_weights"]:
-                avg = insights["avg_weights"][0]
-                n = avg["searches"]
-                i2.markdown(f"**Your average priorities** "
-                            f"(over {n} search{'' if n == 1 else 'es'})")
-                i2.bar_chart(pd.Series({FACTORS[k][0]: avg[k] for k in FACTORS}),
-                             horizontal=True)
-            with st.expander("The MongoDB aggregation behind this"):
-                st.code(json.dumps(prefs.insights_pipeline(user), indent=2), language="json")
+            with st.container(border=True):
+                i1, i2 = st.columns(2)
+                towns_df = pd.DataFrame(insights["towns"])
+                if towns_df.empty:
+                    i1.caption("No town filters in your history yet.")
+                else:
+                    i1.markdown("**Towns you search most**")
+                    i1.bar_chart(towns_df.set_index("_id")["searches"], horizontal=True,
+                                 color=BRAND, x_label="", y_label="searches")
+                if insights["avg_weights"]:
+                    avg = insights["avg_weights"][0]
+                    n = avg["searches"]
+                    i2.markdown(f"**Your average priorities** "
+                                f"(over {n} search{'' if n == 1 else 'es'})")
+                    i2.bar_chart(pd.Series({FACTORS[k][0]: avg[k] for k in FACTORS}),
+                                 horizontal=True, color=BRAND, x_label="",
+                                 y_label="average weight")
+                with st.expander("The MongoDB aggregation behind this", icon=":material/code:"):
+                    st.code(json.dumps(prefs.insights_pipeline(user), indent=2),
+                            language="json")
 
 # ----------------------------------------------------------------- Overview -- #
 with tab_overview:
@@ -546,9 +741,9 @@ The same 2020-2026 HDB resale dataset is loaded two ways:
     rep = st.session_state.report
     if rep:
         cA, cB, cC = st.columns(3)
-        cA.metric("Rows loaded", f"{rep.rows_loaded:,}")
-        cB.metric("PostgreSQL load", f"{rep.total_ms('postgres')/1000:.1f} s")
-        cC.metric("MongoDB load", f"{rep.total_ms('mongodb')/1000:.1f} s")
+        cA.metric("Rows loaded", f"{rep.rows_loaded:,}", border=True)
+        cB.metric("PostgreSQL load", f"{rep.total_ms('postgres')/1000:.1f} s", border=True)
+        cC.metric("MongoDB load", f"{rep.total_ms('mongodb')/1000:.1f} s", border=True)
 
         st.markdown("**Row / document counts**")
         counts = dict(rep.table_counts)
@@ -646,6 +841,7 @@ with tab_crud:
             if "postgres" in engines:
                 try:
                     t = pg.create_transaction(data); record(t); show_timing(t)
+                    _cached_summary.clear()              # banner's sale count changed
                 except Exception as e:
                     st.error(f"PostgreSQL rejected the insert → {type(e).__name__}: {e}")
             if "mongodb" in engines:
@@ -687,6 +883,7 @@ with tab_crud:
         if st.button("Delete", type="primary") and tid:
             if "postgres" in engines:
                 t = pg.delete_transaction(tid); record(t); show_timing(t)
+                _cached_summary.clear()                  # banner's sale count changed
             if "mongodb" in engines:
                 t = mongo.delete_transaction(tid); record(t); show_timing(t)
 
@@ -793,8 +990,8 @@ with tab_bench:
     if "bench" in st.session_state:
         bf = st.session_state.bench
         piv = bf.pivot_table(index="operation", columns="engine", values="ms")
-        st.markdown("**Best latency (ms) — lower is better**")
-        st.bar_chart(piv)
+        st.markdown("**Best latency per operation: shorter bar = faster**")
+        st.altair_chart(_bench_chart(bf), width="stretch")
         if {"postgres", "mongodb"}.issubset(piv.columns):
             # only name a winner when both engines actually ran the operation
             paired = piv[["postgres", "mongodb"]].notna().all(axis=1)
@@ -885,3 +1082,23 @@ with tab_notes:
    point of the comparison.
         """
     )
+
+
+# --------------------------------------------------------------------------- #
+#  Sidebar operation log (rendered last so it includes this run's timings)   #
+# --------------------------------------------------------------------------- #
+with log_slot:
+    log = st.session_state.log
+    with st.expander(f":material/timer: Operation log ({len(log)})"):
+        if log:
+            log_df = pd.DataFrame(
+                [(t.engine, t.label, round(t.ms, 2), t.rows) for t in log],
+                columns=["engine", "operation", "ms", "rows"],
+            )
+            st.dataframe(log_df, height=210, width="stretch", hide_index=True)
+            st.download_button("Download log CSV", log_df.to_csv(index=False),
+                               "timing_log.csv", "text/csv", width="stretch")
+            if st.button("Clear log", width="stretch"):
+                st.session_state.log = []; st.rerun()
+        else:
+            st.caption("Nothing yet: every database operation you run is timed here.")

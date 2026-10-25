@@ -194,6 +194,8 @@ Project/
 ├─ config.py              connection strings + paths (edit here)
 ├─ requirements.txt
 ├─ run_app.ps1            start PG (if needed) + launch Streamlit
+├─ .streamlit/config.toml theme: colours, fonts, sidebar, chart palette
+├─ assets/style.css       styles for the banner, result cards, timing badges
 ├─ scripts/
 │  ├─ pg_setup.ps1        one-time initdb + createdb
 │  ├─ pg_start.ps1 / pg_stop.ps1

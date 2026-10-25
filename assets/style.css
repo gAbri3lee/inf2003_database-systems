@@ -1,0 +1,103 @@
+/* Styles for the app's own HTML blocks (hero, timing badge, result cards).
+   Colours/fonts for Streamlit's built-in widgets live in .streamlit/config.toml. */
+
+/* ---- hero banner ---------------------------------------------------- */
+.hw-hero {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(120deg, #0F766E 0%, #115E59 55%, #134E4A 100%);
+  color: #F0FDFA;
+  border-radius: 1rem;
+  padding: 1.6rem 2rem 1.5rem;
+  margin-bottom: 0.5rem;
+}
+.hw-hero::before, .hw-hero::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.06);
+}
+.hw-hero::before { width: 280px; height: 280px; right: -70px; top: -110px; }
+.hw-hero::after  { width: 180px; height: 180px; right: 140px; bottom: -120px; }
+.hw-brand {
+  font-family: "Plus Jakarta Sans", sans-serif;
+  font-weight: 800;
+  font-size: 2.1rem;
+  letter-spacing: -0.02em;
+  color: #FFFFFF;
+  line-height: 1.15;
+}
+.hw-brand span { color: #5EEAD4; }
+.hw-tagline { margin: 0.35rem 0 1rem; font-size: 1.05rem; opacity: 0.92; max-width: 46rem; }
+.hw-stats { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.hw-stat {
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  padding: 0.28rem 0.8rem;
+  font-size: 0.85rem;
+}
+.hw-stat b { color: #FFFFFF; }
+
+/* ---- timing badge (replaces the big green success box) -------------- */
+.hw-timing {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 999px;
+  padding: 0.25rem 0.8rem 0.25rem 0.3rem;
+  font-size: 0.85rem;
+  color: #334155;
+}
+.hw-timing b { color: #0F172A; }
+.hw-eng {
+  border-radius: 999px;
+  padding: 0.1rem 0.6rem;
+  font-weight: 600;
+  font-size: 0.75rem;
+  color: #FFFFFF;
+  background: #64748B;
+}
+.hw-eng.postgres { background: #2563EB; }
+.hw-eng.mongodb  { background: #16A34A; }
+
+/* ---- top-result cards ------------------------------------------------ */
+.hw-card {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 0.9rem;
+  padding: 1rem 1.1rem 1.1rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 6px 18px rgba(15, 23, 42, 0.06);
+}
+.hw-card-top { display: flex; justify-content: space-between; align-items: center; }
+.hw-rank {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #0F766E;
+  background: #CCFBF1;
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+}
+.hw-score {
+  font-family: "Plus Jakarta Sans", sans-serif;
+  font-weight: 800;
+  font-size: 1.7rem;
+  color: #0F172A;
+  line-height: 1;
+}
+.hw-score small { font-size: 0.8rem; color: #64748B; font-weight: 600; }
+.hw-bar { height: 6px; background: #E2E8F0; border-radius: 999px; overflow: hidden; margin: 0.6rem 0 0.7rem; }
+.hw-bar > div { height: 100%; background: linear-gradient(90deg, #2DD4BF, #0F766E); border-radius: 999px; }
+.hw-addr { font-weight: 700; font-size: 1.05rem; color: #0F172A; }
+.hw-sub { color: #64748B; font-size: 0.85rem; margin-top: 0.1rem; }
+.hw-price { font-weight: 700; font-size: 1.2rem; color: #0F766E; margin: 0.55rem 0 0.5rem; }
+.hw-facts { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.hw-facts span {
+  background: #F1F5F9;
+  border-radius: 0.4rem;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.78rem;
+  color: #334155;
+}

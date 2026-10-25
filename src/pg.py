@@ -15,7 +15,6 @@ Plus CHECK constraints, foreign keys, and two VIEWs used by the GUI.
 """
 from __future__ import annotations
 
-import datetime as dt
 from contextlib import contextmanager
 
 import pandas as pd
@@ -292,6 +291,18 @@ class PgRepo:
             for tbl in LOAD_ORDER:
                 out[tbl] = c.execute(f"SELECT COUNT(*) AS n FROM {tbl}").fetchone()["n"]
         return out
+
+    def summary(self):
+        """Headline numbers for the GUI banner, in one round trip."""
+        with self.conn(autocommit=True) as c, stopwatch("summary counts", "postgres") as t:
+            row = c.execute(
+                "SELECT (SELECT COUNT(*) FROM transactions) AS n,"
+                "       (SELECT MIN(month) FROM transactions) AS lo,"
+                "       (SELECT MAX(month) FROM transactions) AS hi,"
+                "       (SELECT COUNT(*) FROM towns) AS towns,"
+                "       (SELECT COUNT(*) FROM blocks) AS blocks"
+            ).fetchone()
+        return row, t
 
     def distinct(self, column: str, table: str = "v_transactions_full") -> list:
         with self.conn(autocommit=True) as c:

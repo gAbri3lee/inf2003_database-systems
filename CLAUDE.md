@@ -87,6 +87,13 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   `value=`; to change them programmatically (loading a profile/saved search),
   set `st.session_state.ff_pending` and `st.rerun()` — `_ff_apply` writes the
   keys at the top of the next run, before the widgets exist.
+* Look and feel: widget colours, fonts and the dark sidebar come from
+  [.streamlit/config.toml](.streamlit/config.toml) (only read at server
+  start — restart Streamlit after editing it). [assets/style.css](assets/style.css)
+  styles only the app's own HTML (`hw-*` classes: hero banner, result cards,
+  `show_timing` badge); don't target Streamlit's internal `data-testid`s.
+  `chartCategoricalColors` relies on engine columns sorting alphabetically
+  (mongodb → green, postgres → blue); single-series charts pass `color=` explicitly.
 * **Find a flat** splits work the way the project proposal does:
   `PgRepo.score_flats` ranks sales with `PERCENT_RANK()` window functions over
   `v_transactions_full` (factors in `SCORE_FACTORS`), while
