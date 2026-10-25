@@ -29,7 +29,8 @@ import config
 from src import cleaning
 from src.loader import run_load
 from src.mongo import MongoRepo
-from src.pg import PgRepo
+from src.pg import SCORE_FACTORS, PgRepo
+from src.prefs import PrefsRepo
 from src.timing import Timing
 
 st.set_page_config(page_title="HDB SQL vs NoSQL", layout="wide", page_icon="🏙️")
@@ -48,6 +49,11 @@ def get_mongo() -> MongoRepo:
     return MongoRepo(config.MONGO_URI, config.MONGO_DB, config.MONGO_COLLECTION)
 
 
+@st.cache_resource
+def get_prefs() -> PrefsRepo:
+    return PrefsRepo(get_mongo().client, config.MONGO_USER_DB)
+
+
 if "log" not in st.session_state:
     st.session_state.log = []           # list[Timing]
 if "report" not in st.session_state:
@@ -55,6 +61,37 @@ if "report" not in st.session_state:
 
 pg = get_pg()
 mongo = get_mongo()
+prefs = get_prefs()
+
+# Find-a-flat factors, in display order: key -> (label, explanation). The
+# explanation is formatted with the result row plus s (the 0-100 sub-score).
+FACTORS = {
+    "afford": ("Affordability", "cheaper than {s:.0f}% of {flat_type} flats sold"),
+    "mrt": ("MRT access", "closer to an MRT than {s:.0f}% of flats "
+                          "({distance_to_mrt_m:,.0f} m to {nearest_mrt})"),
+    "school": ("Primary school", "closer to a primary school than {s:.0f}% "
+                                 "({distance_to_pri_school_m:,.0f} m to {nearest_school})"),
+    "hawker": ("Hawker food", "closer to a hawker centre than {s:.0f}% "
+                              "({hawker_distance_m:,.0f} m to {nearest_hawker})"),
+    "park": ("Green space", "closer to a park than {s:.0f}% "
+                            "({park_distance_m:,.0f} m to {nearest_park})"),
+    "cbd": ("City centre", "closer to the CBD than {s:.0f}% "
+                           "({distance_to_cbd_m:,.0f} m)"),
+    "lease": ("Lease left", "more lease left than {s:.0f}% ({lease_years} years)"),
+}
+DEFAULT_WEIGHTS = {"afford": 70, "mrt": 60, "school": 40, "hawker": 40,
+                   "park": 30, "cbd": 20, "lease": 50}
+# saved-search filter field -> its widget key on the Find a flat tab
+FILTER_KEYS = {
+    "towns": "ff_towns", "flat_types": "ff_types", "budget_max": "ff_budget",
+    "area_min": "ff_area", "lease_min_years": "ff_lease",
+    "months_back": "ff_months", "one_per_block": "ff_one_per_block",
+}
+FF_DEFAULTS = {
+    "ff_towns": [], "ff_types": [], "ff_budget": 800_000, "ff_area": 0,
+    "ff_lease": 0, "ff_months": 12, "ff_one_per_block": True,
+    **{f"ff_w_{k}": v for k, v in DEFAULT_WEIGHTS.items()},
+}
 
 
 def record(*timings: Timing):
@@ -111,6 +148,77 @@ def _mongo_doc_from_input(m: MongoRepo, data: dict) -> dict:
         "remaining_lease_months": data.get("remaining_lease_months"),
         "block": block,
     }
+
+
+# ---- Find a flat helpers ------------------------------------------------- #
+MONTH_OPTS = [6, 12, 24, 36, 0]          # 0 = every sale in the dataset
+
+
+def _prefs_ready(mongo_up: bool) -> bool:
+    """Create the MongoDB user collections once per session."""
+    if not mongo_up:
+        return False
+    if not st.session_state.get("prefs_ready"):
+        try:
+            prefs.ensure_schema()
+        except Exception as e:
+            st.warning(f"Couldn't prepare the MongoDB user collections: {e}")
+            return False
+        st.session_state.prefs_ready = True
+    return True
+
+
+def _ff_weights() -> dict:
+    return {k: int(st.session_state[f"ff_w_{k}"]) for k in FACTORS}
+
+
+def _ff_filters() -> dict:
+    return {field: st.session_state[key] for field, key in FILTER_KEYS.items()}
+
+
+def _ff_apply(search: dict, town_opts: list, type_opts: list):
+    """Load a profile / saved search / history entry into the widgets. Must run
+    before the widgets are created in this script run."""
+    ss = st.session_state
+    for k, v in (search.get("weights") or {}).items():
+        if k in FACTORS:
+            ss[f"ff_w_{k}"] = int(v)
+    for field, value in (search.get("filters") or {}).items():
+        if field in FILTER_KEYS and value is not None:
+            ss[FILTER_KEYS[field]] = value
+    # drop values the dropdowns can't show (e.g. a town missing from this load)
+    ss.ff_towns = [t for t in ss.ff_towns if t in town_opts]
+    ss.ff_types = [t for t in ss.ff_types if t in type_opts]
+    if ss.ff_months not in MONTH_OPTS:
+        ss.ff_months = 12
+
+
+def _ff_explain(key: str, r: pd.Series) -> str:
+    label, template = FACTORS[key]
+    s = float(r[f"s_{key}"])
+    if pd.isna(r.get(SCORE_FACTORS[key][0])):
+        return f"**{label}**: no data for this flat (scored 0)"
+    fields = {**r.to_dict(), "s": s}
+    if pd.notna(r.get("remaining_lease_months")):
+        fields["lease_years"] = int(r["remaining_lease_months"]) // 12
+    try:
+        return f"**{label}**: {template.format(**fields)}"
+    except (KeyError, TypeError, ValueError):
+        return f"**{label}**: {s:.0f}/100"
+
+
+def _ff_summary(f: dict) -> str:
+    parts = [f"last {f['months_back']} months" if f.get("months_back") else "all years",
+             ", ".join(f.get("towns") or []) or "any town",
+             ", ".join(f.get("flat_types") or []) or "any type"]
+    if f.get("budget_max"):
+        parts.append(f"up to ${f['budget_max']:,}")
+    return " · ".join(parts)
+
+
+def _local_time(t: dt.datetime) -> str:
+    """MongoDB hands back naive UTC datetimes; show them in local time."""
+    return t.replace(tzinfo=dt.timezone.utc).astimezone().strftime("%d %b %H:%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -176,9 +284,249 @@ with st.sidebar:
 # --------------------------------------------------------------------------- #
 #  Main tabs                                                                  #
 # --------------------------------------------------------------------------- #
-tab_overview, tab_crud, tab_filter, tab_bench, tab_notes = st.tabs(
-    ["📋 Overview", "✏️ CRUD", "🔎 Filter", "⏱️ Benchmark", "🧠 Notes"]
+tab_find, tab_overview, tab_crud, tab_filter, tab_bench, tab_notes = st.tabs(
+    ["🏠 Find a flat", "📋 Overview", "✏️ CRUD", "🔎 Filter", "⏱️ Benchmark", "🧠 Notes"]
 )
+
+# -------------------------------------------------------------- Find a flat -- #
+with tab_find:
+    ss = st.session_state
+    st.subheader("Find a flat that fits your priorities")
+    st.caption("Scores are computed in **PostgreSQL** (window functions over the "
+               "8-table view). Your profile, saved searches and search history "
+               "are stored in **MongoDB**.")
+    for _k, _v in FF_DEFAULTS.items():
+        ss.setdefault(_k, _v)
+
+    town_opts = pg_distinct("town")
+    type_opts = pg_distinct("flat_type")
+    # deferred widget updates from the previous run (see _ff_apply)
+    if "ff_pending" in ss:
+        _ff_apply(ss.pop("ff_pending"), town_opts, type_opts)
+    if "ff_profile_pending" in ss:
+        ss.ff_profile = ss.pop("ff_profile_pending")
+        ss.ff_new_profile = ""
+
+    if not pg_ok:
+        st.warning("PostgreSQL is down, so searching is unavailable.")
+    elif not town_opts:
+        st.info("No data loaded yet: use the sidebar → **Build schema + load CSV**.")
+
+    # ---- profile (MongoDB) ---------------------------------------------- #
+    use_prefs = _prefs_ready(mongo_ok)
+    profile_opts = ["(guest)"] + (prefs.profiles() if use_prefs else [])
+    if ss.get("ff_profile") not in profile_opts:
+        ss.ff_profile = "(guest)"
+    pc1, pc2, pc3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+    profile = pc1.selectbox("Profile (stored in MongoDB)", profile_opts,
+                            key="ff_profile", disabled=not use_prefs)
+    new_name = pc2.text_input("New profile name", key="ff_new_profile",
+                              placeholder="e.g. Matthias", disabled=not use_prefs)
+    if pc3.button("Create profile", key="ff_create_profile", disabled=not use_prefs):
+        name = new_name.strip()
+        if not name:
+            st.warning("Type a profile name first.")
+        elif name in profile_opts:
+            st.warning(f"'{name}' already exists: pick it from the list.")
+        else:
+            record(prefs.save_profile(name, _ff_weights(), _ff_filters()))
+            ss.ff_profile_pending = name
+            ss.ff_loaded_profile = name      # its settings are already on screen
+            st.rerun()
+
+    user = None if profile == "(guest)" else profile
+    if user is None:
+        ss.ff_loaded_profile = None
+    elif ss.get("ff_loaded_profile") != user:
+        doc, t = prefs.get_profile(user)
+        record(t)
+        ss.ff_loaded_profile = user
+        if doc:
+            ss.ff_pending = {"weights": doc.get("weights"), "filters": doc.get("filters")}
+            st.rerun()
+
+    # ---- filters + priorities ------------------------------------------ #
+    st.markdown("##### What are you looking for?")
+    c1, c2 = st.columns(2)
+    c1.multiselect("Towns (leave empty for anywhere)", town_opts, key="ff_towns")
+    c2.multiselect("Flat types (leave empty for any)", type_opts, key="ff_types")
+    c3, c4, c5, c6 = st.columns(4)
+    c3.slider("Max budget (SGD)", 200_000, 2_000_000, step=10_000, key="ff_budget")
+    c4.number_input("Min floor area (sqm)", 0, 300, step=5, key="ff_area")
+    c5.slider("Min lease left (years)", 0, 95, step=5, key="ff_lease")
+    c6.selectbox("Compare against sales from", MONTH_OPTS, key="ff_months",
+                 format_func=lambda m: f"the last {m} months" if m else "all years (2020–2026)")
+    st.checkbox("One result per block (its best-scoring sale)", key="ff_one_per_block")
+
+    st.markdown("##### What matters to you? (0 = don't care)")
+    factor_keys = list(FACTORS)
+    for row_keys in (factor_keys[:4], factor_keys[4:]):
+        for col, k in zip(st.columns(4), row_keys):
+            col.slider(FACTORS[k][0], 0, 100, step=5, key=f"ff_w_{k}")
+
+    b1, b2, b3, b4 = st.columns([1, 1.2, 1.8, 1], vertical_alignment="bottom")
+    find = b1.button("🔎 Find flats", type="primary", key="ff_find",
+                     disabled=not (pg_ok and town_opts))
+    save_defaults = b2.button("Save as my defaults", key="ff_save_profile",
+                              disabled=user is None)
+    search_name = b3.text_input("Search name", key="ff_search_name",
+                                placeholder="e.g. Near my parents", disabled=user is None)
+    save_search = b4.button("Save search", key="ff_save_search", disabled=user is None)
+    if use_prefs and user is None:
+        st.caption("Pick or create a profile to save your preferences and searches.")
+
+    if save_defaults:
+        record(prefs.save_profile(user, _ff_weights(), _ff_filters()))
+        st.toast(f"Saved these settings as {user}'s defaults")
+    if save_search:
+        if not search_name.strip():
+            st.warning("Give the search a name first.")
+        else:
+            record(prefs.save_search(user, search_name.strip(), _ff_weights(), _ff_filters()))
+            st.toast(f"Saved search '{search_name.strip()}'")
+
+    if find:
+        weights, filters = _ff_weights(), _ff_filters()
+        if sum(weights.values()) == 0:
+            st.warning("Set at least one priority above 0.")
+        else:
+            try:
+                rows, t, sql_text = pg.score_flats(filters, weights, limit=50)
+            except Exception as e:
+                st.error(f"Search failed: {e}. If the data was loaded by an older "
+                         "version of the app, rebuild it from the sidebar.")
+            else:
+                record(t)
+                df = pd.DataFrame(rows)
+                for col in ["score", "resale_price", "price_per_sqm",
+                            *[f"s_{k}" for k in FACTORS]]:
+                    if col in df:
+                        df[col] = df[col].astype(float)   # NUMERIC arrives as Decimal
+                ss.ff_result = {"df": df, "weights": weights, "sql": sql_text, "timing": t}
+                if user:
+                    top_ids = df["transaction_id"].head(5).tolist() if len(df) else []
+                    record(prefs.log_search(user, weights, filters, len(df), top_ids))
+
+    # ---- results ------------------------------------------------------- #
+    res = ss.get("ff_result")
+    if res:
+        df, weights = res["df"], res["weights"]
+        show_timing(res["timing"])
+        if df.empty:
+            st.info("No flats match those filters. Try a higher budget, more towns "
+                    "or a longer time window.")
+        else:
+            total = sum(weights.values())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Matches shown", len(df))
+            m2.metric("Best score", f"{df['score'].iloc[0]:.0f} / 100")
+            m3.metric("Compared against", f"{int(df['pool_size'].iloc[0]):,} sales")
+
+            left, right = st.columns([3, 2])
+            with left:
+                event = st.dataframe(
+                    df[["score", "town", "block_no", "street_name", "flat_type",
+                        "storey_range", "floor_area_sqm", "resale_price", "month",
+                        "remaining_lease"]],
+                    hide_index=True, width="stretch", height=420, key="ff_table",
+                    on_select="rerun", selection_mode="single-row",
+                    column_config={
+                        "score": st.column_config.ProgressColumn(
+                            "Score", min_value=0, max_value=100, format="%.0f"),
+                        "town": "Town", "block_no": "Block", "street_name": "Street",
+                        "flat_type": "Type", "storey_range": "Storey",
+                        "floor_area_sqm": st.column_config.NumberColumn("sqm", format="%d"),
+                        "resale_price": st.column_config.NumberColumn("Price", format="$%d"),
+                        "month": st.column_config.DateColumn("Sold", format="MMM YYYY"),
+                        "remaining_lease": "Lease left",
+                    },
+                )
+                st.caption("Click a row to see why it scored the way it did.")
+            picked = event.selection.rows
+            idx = picked[0] if picked and picked[0] < len(df) else 0
+            with right:
+                pts = df.dropna(subset=["latitude", "longitude"]).copy()
+                pts["colour"] = "#4c78a8"
+                pts["size"] = 40
+                pts.loc[pts.index == idx, ["colour", "size"]] = ["#e4572e", 110]
+                st.map(pts, latitude="latitude", longitude="longitude",
+                       color="colour", size="size")
+
+            r = df.iloc[idx]
+            st.markdown(f"#### #{idx + 1} · Blk {r['block_no']} {r['street_name']}, "
+                        f"{r['town']}: **{r['score']:.0f} / 100**")
+            st.caption(f"{r['flat_type']} · storey {r['storey_range']} · "
+                       f"{r['floor_area_sqm']:.0f} sqm · sold "
+                       f"{pd.Timestamp(r['month']):%b %Y} for ${r['resale_price']:,.0f}")
+            active = [k for k in FACTORS if weights.get(k, 0) > 0]
+            bd1, bd2 = st.columns([2, 3])
+            contrib = pd.DataFrame(
+                {"points": [r[f"s_{k}"] * weights[k] / total for k in active]},
+                index=[FACTORS[k][0] for k in active])
+            bd1.bar_chart(contrib, horizontal=True, height=260)
+            bd1.caption("Each bar is sub-score × your weight ÷ total weight, "
+                        "so the bars add up to the score.")
+            bd2.markdown("\n".join(f"- {_ff_explain(k, r)} (weight {weights[k]})"
+                                   for k in active))
+            ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
+            if ignored:
+                bd2.caption("Not counted (weight 0): " + ", ".join(ignored))
+            with st.expander("Show the SQL behind this ranking"):
+                st.code(res["sql"], language="sql")
+
+    # ---- saved searches + history (MongoDB) ---------------------------- #
+    if user:
+        st.divider()
+        h1, h2 = st.columns(2)
+        with h1:
+            st.markdown("##### ⭐ Saved searches")
+            saved = prefs.saved_searches(user)
+            if not saved:
+                st.caption("None yet: set up a search, name it and click **Save search**.")
+            for s in saved:
+                sc1, sc2, sc3 = st.columns([4, 1, 1], vertical_alignment="center")
+                sc1.markdown(f"**{s['name']}**  \n{_ff_summary(s['filters'])}")
+                if sc2.button("Load", key=f"ff_load_{s['_id']}"):
+                    ss.ff_pending = s
+                    st.rerun()
+                if sc3.button("Delete", key=f"ff_del_{s['_id']}"):
+                    record(prefs.delete_search(s["_id"]))
+                    st.rerun()
+        with h2:
+            st.markdown("##### 🕘 Recent searches")
+            history = prefs.recent_history(user, 5)
+            if not history:
+                st.caption("Your searches will appear here.")
+            for h in history:
+                hc1, hc2 = st.columns([5, 1], vertical_alignment="center")
+                hc1.markdown(f"{_local_time(h['searched_at'])} · "
+                             f"{h.get('result_count', 0)} results  \n{_ff_summary(h['filters'])}")
+                if hc2.button("Load", key=f"ff_hist_{h['_id']}"):
+                    ss.ff_pending = h
+                    st.rerun()
+
+        if st.button("📊 Analyse my search history", key="ff_insights"):
+            insights, t = prefs.insights(user)
+            record(t)
+            ss.ff_insights_data = (user, insights)
+        if ss.get("ff_insights_data") and ss.ff_insights_data[0] == user:
+            insights = ss.ff_insights_data[1]
+            i1, i2 = st.columns(2)
+            towns_df = pd.DataFrame(insights["towns"])
+            if towns_df.empty:
+                i1.caption("No town filters in your history yet.")
+            else:
+                i1.markdown("**Towns you search most**")
+                i1.bar_chart(towns_df.set_index("_id")["searches"], horizontal=True)
+            if insights["avg_weights"]:
+                avg = insights["avg_weights"][0]
+                n = avg["searches"]
+                i2.markdown(f"**Your average priorities** "
+                            f"(over {n} search{'' if n == 1 else 'es'})")
+                i2.bar_chart(pd.Series({FACTORS[k][0]: avg[k] for k in FACTORS}),
+                             horizontal=True)
+            with st.expander("The MongoDB aggregation behind this"):
+                st.code(json.dumps(prefs.insights_pipeline(user), indent=2), language="json")
 
 # ----------------------------------------------------------------- Overview -- #
 with tab_overview:
@@ -315,17 +663,23 @@ with tab_crud:
                                        "storey_range", "flat_type", "remaining_lease",
                                        "floor_area_sqm"])
         raw = st.text_input("New value", value="600000")
+        numeric = field in ("resale_price", "price_per_sqm", "floor_area_sqm")
         if st.button("Update", type="primary") and tid:
-            val: object = raw
-            if field in ("resale_price", "price_per_sqm", "floor_area_sqm"):
-                val = float(raw)
+            try:
+                val: object = float(raw) if numeric else raw
+            except ValueError:
+                st.error(f"'{raw}' isn't a number.")
+                engines = []                 # skip both updates below
             if "postgres" in engines:
                 try:
                     t = pg.update_transaction(tid, {field: val}); record(t); show_timing(t)
                 except Exception as e:
-                    st.error(f"PostgreSQL: {e}")
+                    st.error(f"PostgreSQL rejected the update → {type(e).__name__}: {e}")
             if "mongodb" in engines:
-                t = mongo.update_transaction(tid, {field: val}); record(t); show_timing(t)
+                try:
+                    t = mongo.update_transaction(tid, {field: val}); record(t); show_timing(t)
+                except Exception as e:
+                    st.error(f"MongoDB rejected the update → {type(e).__name__}: {e}")
 
     # ---- DELETE --------------------------------------------------- #
     elif op == "Delete":
@@ -374,7 +728,7 @@ with tab_filter:
     sort_by = c9.selectbox("Sort by", ["resale_price", "month", "price_per_sqm",
                                        "floor_area_sqm"])
     sort_desc = c10.checkbox("Descending", value=True)
-    limit = c11.number_input("Limit", value=200, step=50)
+    limit = c11.number_input("Limit", min_value=1, max_value=5000, value=200, step=50)
 
     params = dict(
         towns=towns, flat_types=flat_types, flat_models=flat_models,
@@ -431,8 +785,9 @@ with tab_bench:
             except Exception as e:
                 st.error(f"MongoDB benchmark failed: {e}")
         record(*results)
-        bf = pd.DataFrame([(t.label, t.engine, round(t.ms, 3), t.rows) for t in results],
-                          columns=["operation", "engine", "ms", "rows"])
+        bf = pd.DataFrame([(t.label, t.engine, round(t.ms, 3), t.rows,
+                            t.extra.get("how", "")) for t in results],
+                          columns=["operation", "engine", "ms", "rows", "how"])
         st.session_state.bench = bf
 
     if "bench" in st.session_state:
@@ -441,14 +796,18 @@ with tab_bench:
         st.markdown("**Best latency (ms) — lower is better**")
         st.bar_chart(piv)
         if {"postgres", "mongodb"}.issubset(piv.columns):
-            piv = piv.assign(**{
-                "faster": piv.apply(lambda r: "MongoDB" if r["mongodb"] < r["postgres"]
-                                    else "PostgreSQL", axis=1),
-                "speedup ×": (piv[["postgres", "mongodb"]].max(axis=1) /
-                              piv[["postgres", "mongodb"]].min(axis=1)).round(1),
-            })
+            # only name a winner when both engines actually ran the operation
+            paired = piv[["postgres", "mongodb"]].notna().all(axis=1)
+            piv["faster"] = piv.apply(
+                lambda r: ("MongoDB" if r["mongodb"] < r["postgres"] else "PostgreSQL")
+                if pd.notna(r["mongodb"]) and pd.notna(r["postgres"]) else "—", axis=1)
+            piv["speedup ×"] = (piv[["postgres", "mongodb"]].max(axis=1) /
+                                piv[["postgres", "mongodb"]].min(axis=1)).round(1).where(paired)
         st.dataframe(piv, width="stretch")
-        st.dataframe(bf, width="stretch")
+        st.caption("`rows` differ on purpose for substring/geo search: PostgreSQL "
+                   "searches the ~10k blocks, MongoDB the ~172k transactions that "
+                   "each embed a copy of their block.")
+        st.dataframe(bf, width="stretch", hide_index=True)
 
 # -------------------------------------------------------------------- Notes -- #
 with tab_notes:
@@ -494,7 +853,7 @@ with tab_notes:
 ### Where **MongoDB / NoSQL** wins
 * **Single-round-trip reads with context.** The block + all amenity data is
   embedded, so a read is one `_id` lookup, **no joins** — compare CRUD → Read →
-  Both, and "filter town + top-20" (served entirely from the
+  Both, and "top-20 by price in one town" (served entirely from the
   `{block.town, resale_price}` compound index).
 * **Flexible schema / evolution.** Add a new nested amenity by just writing a new
   key — no migration, no `ALTER TABLE`. The `$jsonSchema` validator is opt-in.

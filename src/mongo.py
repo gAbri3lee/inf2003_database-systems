@@ -14,6 +14,8 @@ back to a full-table haversine scan because the portable build has no PostGIS).
 from __future__ import annotations
 
 import datetime as dt
+import itertools
+import re
 
 from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
 from pymongo.errors import OperationFailure
@@ -198,7 +200,8 @@ class MongoRepo:
         if p.get("max_dist_mrt") is not None:
             q["block.nearest.mrt.distance_m"] = {"$lte": p["max_dist_mrt"]}
         if p.get("street_like"):
-            q["block.street_name"] = {"$regex": p["street_like"], "$options": "i"}
+            # escaped so it behaves like SQL's ILIKE '%text%' (and "(" can't crash it)
+            q["block.street_name"] = {"$regex": re.escape(p["street_like"]), "$options": "i"}
         if p.get("near_point"):
             np_ = p["near_point"]
             q["block.location"] = {
@@ -216,13 +219,16 @@ class MongoRepo:
         with stopwatch("filter query", "mongodb") as t:
             docs = list(self.coll.find(q).sort(sort_field, direction).limit(int(limit)))
         t.rows = len(docs)
-        self._last_query = q
+        self._last_find = (q, sort_field, direction, int(limit))
         return docs, t, q
 
     def explain_last(self) -> dict:
-        if not getattr(self, "_last_query", None):
+        """Explain the most recent filter() exactly as run (sort + limit included)."""
+        if getattr(self, "_last_find", None) is None:
             return {"note": "run a filter first"}
-        return self.coll.find(self._last_query).explain().get("executionStats", {})
+        q, sort_field, direction, limit = self._last_find
+        cursor = self.coll.find(q).sort(sort_field, direction).limit(limit)
+        return cursor.explain().get("executionStats", {})
 
     # -------------------------------------------------- benchmark ------- #
     def benchmark(self, repeat: int = 5) -> list[Timing]:
@@ -235,45 +241,67 @@ class MongoRepo:
                                        {"block.location": 1})
         centre = centre_doc["block"]["location"]["coordinates"] if centre_doc else None
 
-        def run(label, fn):
+        # Labels must match PgRepo.benchmark exactly: the GUI pairs the two
+        # engines by label. Engine-specific detail goes in extra["how"].
+        def run(label, how, fn):
             best, rows = None, 0
             for _ in range(repeat):
                 with stopwatch(label, "mongodb") as t:
                     rows = fn()
                 best = t.ms if best is None else min(best, t.ms)
-            results.append(Timing(label=label, engine="mongodb", ms=best, rows=rows))
+            results.append(Timing(label=label, engine="mongodb", ms=best,
+                                  rows=rows, extra={"how": how}))
 
         if pid:
-            run("point lookup by _id",
+            run("point lookup by id", "_id index",
                 lambda: 1 if self.coll.find_one({"_id": pid}) else 0)
-        run("indexed range scan (price BETWEEN)", lambda: _agg_count(
-            self.coll, [{"$match": {"resale_price": {"$gte": 400000, "$lte": 650000}}},
-                        {"$group": {"_id": None, "n": {"$sum": 1},
-                                    "avg": {"$avg": "$resale_price"}}}]))
-        run("aggregate group-by town (embedded, no join)", lambda: _agg_count(
-            self.coll, [{"$group": {"_id": "$block.town", "n": {"$sum": 1},
-                                    "avg": {"$avg": "$resale_price"}}}]))
-        run("monthly price trend (group-by month)", lambda: _agg_count(
-            self.coll, [{"$group": {"_id": "$month", "n": {"$sum": 1},
-                                    "avg": {"$avg": "$resale_price"}}},
-                        {"$sort": {"_id": 1}}]))
+        run("indexed range scan (price BETWEEN)", "index on resale_price + $group",
+            lambda: _agg_count(
+                self.coll, [{"$match": {"resale_price": {"$gte": 400000, "$lte": 650000}}},
+                            {"$group": {"_id": None, "n": {"$sum": 1},
+                                        "avg": {"$avg": "$resale_price"}}}]))
+        run("aggregate group-by town", "$group on embedded block.town (no join)",
+            lambda: _agg_count(
+                self.coll, [{"$group": {"_id": "$block.town", "n": {"$sum": 1},
+                                        "avg": {"$avg": "$resale_price"}}}]))
+        run("monthly price trend (group-by month)", "$group on month",
+            lambda: _agg_count(
+                self.coll, [{"$group": {"_id": "$month", "n": {"$sum": 1},
+                                        "avg": {"$avg": "$resale_price"}}},
+                            {"$sort": {"_id": 1}}]))
         if some_town:
-            run("filter town + top-20 by price (no join needed)", lambda: len(list(
-                self.coll.find({"block.town": some_town})
-                .sort("resale_price", DESCENDING).limit(20))))
-        run("substring search (street regex)", lambda: _agg_count(
-            self.coll, [{"$match": {"block.street_name": {"$regex": "TAMPINES",
-                                                          "$options": "i"}}},
-                        {"$count": "n"}]))
+            run("top-20 by price in one town", "compound index {block.town, resale_price}",
+                lambda: len(list(
+                    self.coll.find({"block.town": some_town})
+                    .sort("resale_price", DESCENDING).limit(20))))
+        run("substring search on street",
+            "$regex over every transaction (block data is repeated per sale)",
+            lambda: _agg_count(
+                self.coll, [{"$match": {"block.street_name": {"$regex": "TAMPINES",
+                                                              "$options": "i"}}},
+                            {"$count": "n"}]))
         if centre:
-            run("geo radius 1km (2dsphere index)", lambda: self.coll.count_documents(
-                {"block.location": {"$geoWithin": {"$centerSphere": [
-                    centre, 1000 / 6_378_137.0]}}}))
-        run("bulk update (recompute psm, pipeline)", lambda: self.coll.update_many(
-            {"flat_type": "4 ROOM"},
-            [{"$set": {"price_per_sqm": {"$round": [
-                {"$divide": ["$resale_price", "$floor_area_sqm"]}, 2]}}}],
-        ).modified_count)
+            run("geo radius 1 km", "2dsphere index, $geoWithin",
+                lambda: self.coll.count_documents(
+                    {"block.location": {"$geoWithin": {"$centerSphere": [
+                        centre, 1000 / 6_378_137.0]}}}))
+        # A standalone mongod has no multi-document rollback, so write the
+        # recomputed value into a scratch field and $unset it afterwards. The
+        # value changes every repetition: otherwise MongoDB skips the no-op
+        # writes and we'd be timing a scan, not an update.
+        rep = itertools.count(1)
+        try:
+            run("bulk update (recompute price/sqm)",
+                "update_many pipeline into a scratch field, $unset afterwards",
+                lambda: self.coll.update_many(
+                    {"flat_type": "4 ROOM"},
+                    [{"$set": {"_bench_psm": {"$add": [{"$round": [
+                        {"$divide": ["$resale_price", "$floor_area_sqm"]}, 2]},
+                        next(rep)]}}}],
+                ).modified_count)
+        finally:
+            self.coll.update_many({"_bench_psm": {"$exists": True}},
+                                  {"$unset": {"_bench_psm": ""}})
         return results
 
 

@@ -78,11 +78,28 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   DB call in both repos and is the sole source of the millisecond numbers
   shown in the GUI and appended to the sidebar operation log — any new DB
   operation should be wrapped in `stopwatch(label, engine)` to stay consistent.
-* [app.py](app.py) is a single-file Streamlit app with 5 tabs (Overview,
-  CRUD, Filter, Benchmark, Notes) plus a sidebar (connection health, build/load
-  controls, operation log). `PgRepo`/`MongoRepo` instances are memoized via
-  `@st.cache_resource`; distinct-value lookups for filter dropdowns are
-  memoized via `@st.cache_data` and explicitly cleared after a reload.
+* [app.py](app.py) is a single-file Streamlit app with 6 tabs (Find a flat,
+  Overview, CRUD, Filter, Benchmark, Notes) plus a sidebar (connection health,
+  build/load controls, operation log). `PgRepo`/`MongoRepo`/`PrefsRepo`
+  instances are memoized via `@st.cache_resource`; distinct-value lookups for
+  filter dropdowns are memoized via `@st.cache_data` and explicitly cleared
+  after a reload. Find-a-flat widgets all use `ff_*` keys and are never given
+  `value=`; to change them programmatically (loading a profile/saved search),
+  set `st.session_state.ff_pending` and `st.rerun()` — `_ff_apply` writes the
+  keys at the top of the next run, before the widgets exist.
+* **Find a flat** splits work the way the project proposal does:
+  `PgRepo.score_flats` ranks sales with `PERCENT_RANK()` window functions over
+  `v_transactions_full` (factors in `SCORE_FACTORS`), while
+  [src/prefs.py](src/prefs.py) (`PrefsRepo`) stores user profiles, saved
+  searches and search history in MongoDB. Those live in a separate database
+  (`MONGO_USER_DB`, default `hdb_users`) because `MongoRepo.build_schema` drops
+  the whole `MONGO_DB` on every reload.
+* The GUI pairs benchmark results across engines **by label**, so each
+  operation must have the identical label in `PgRepo.benchmark` and
+  `MongoRepo.benchmark`; put engine-specific detail in `Timing.extra["how"]`.
+  PostgreSQL CRUD/filter methods open their connection *before* the
+  stopwatch starts so connect/login time isn't counted (MongoDB reuses a
+  pooled client).
 
 **The two schemas are deliberately mirror images of each other**, designed to
 make the SQL-vs-NoSQL tradeoffs visible rather than to be "the best" schema

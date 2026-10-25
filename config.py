@@ -45,6 +45,9 @@ def pg_dsn(dbname: str | None = None) -> str:
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 MONGO_DB = os.environ.get("MONGO_DB", "hdb")
 MONGO_COLLECTION = "transactions"
+# User profiles / saved searches / history. A separate database because a
+# data reload drops MONGO_DB entirely.
+MONGO_USER_DB = os.environ.get("MONGO_USER_DB", "hdb_users")
 
 # --- Loader knobs ------------------------------------------------------------
 PG_COPY_PAGE = 10_000          # rows per COPY flush

@@ -161,6 +161,18 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
         if col not in df.columns:
             df[col] = default
 
+    # Strip before deriving IDs so a stray trailing space can't split one
+    # block (or hawker/park) into two surrogate IDs.
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].str.strip()
+
+    # The CSV stores postal codes as floats ("570192.0"), which also drops the
+    # leading zero for districts 01-09 ("85701.0" is really "085701").
+    df["postal_code"] = (
+        df["postal_code"].str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    )
+
     if df["property_address"].isna().all():
         df["property_address"] = (
             df["block_no"].fillna("").str.strip() + " "
@@ -199,10 +211,6 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
             f"TX_{int(value):016x}_{int(sequence):03d}"
             for value, sequence in zip(txn_hash, duplicate_no)
         ]
-
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].str.strip()
 
     # money -> float
     for col in MONEY_COLS:
