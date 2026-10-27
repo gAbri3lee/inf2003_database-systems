@@ -39,10 +39,3 @@ def stopwatch(label: str, engine: str = ""):
         yield t
     finally:
         t.ms = (time.perf_counter() - start) * 1000.0
-
-
-def timed(fn, *args, **kwargs):
-    """Call ``fn`` and return ``(result, elapsed_ms)``."""
-    start = time.perf_counter()
-    result = fn(*args, **kwargs)
-    return result, (time.perf_counter() - start) * 1000.0

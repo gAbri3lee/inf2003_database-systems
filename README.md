@@ -67,21 +67,38 @@ Streamlit opens `http://localhost:8501`.
 ## 4. Using the GUI
 
 1. **Sidebar → ② Build & load** — point at the CSV (defaults to
-   `..\..\HDB_Compass_2020_2026_updated_data.csv`), optionally cap the row
-   count for a quick run, then **Build schema + load CSV**. Per-stage timings
-   appear on the **Overview** tab.
-2. **CRUD tab** — pick *PostgreSQL*, *MongoDB* or *Both*, then Read / Create /
+   `HDB_Compass_trimmed_updated.csv` in the project folder; override with the
+   `HDB_CSV` environment variable), optionally cap the row count for a quick
+   run, then **Build schema + load CSV**. Per-stage timings appear on the
+   **Overview** tab.
+2. **Find a flat tab** — the buyer-facing part of the app.
+   * Pick towns, flat types, budget, minimum size / lease, and how far back to
+     compare sales, then set a 0–100 weight for each priority (affordability,
+     MRT, primary school, hawker food, green space, city centre, lease left).
+   * **Find flats** ranks recent sales by a compatibility score computed in
+     PostgreSQL. Each factor is a percentile against every sale in the chosen
+     period (e.g. "closer to an MRT than 90% of flats"), and the score is the
+     weighted average. Click a row to see its score breakdown; the map
+     highlights it. *Show the SQL* reveals the query.
+   * Choose or create a **profile** to save your weights as defaults, save
+     named searches, reload past searches, and run **Analyse my search
+     history** (a MongoDB `$facet` aggregation). All of this is stored in
+     MongoDB.
+3. **CRUD tab** — pick *PostgreSQL*, *MongoDB* or *Both*, then Read / Create /
    Update / Delete a transaction. Each operation prints its millisecond time and
    is appended to the sidebar **operation log** (downloadable as CSV).
-3. **Filter tab** — build a predicate once (town, flat type, price/area ranges,
+4. **Filter tab** — build a predicate once (town, flat type, price/area ranges,
    month window, distance to MRT, street substring, optional geo radius), run it
    on either engine, and see the generated **SQL** vs the **Mongo query
    document** side by side, with timings and an optional query plan.
-4. **Benchmark tab** — repeats a fixed set of operations (point lookup, indexed
+5. **Benchmark tab** — repeats a fixed set of operations (point lookup, indexed
    range scan, grouped aggregates, a 7-table join / no-join read, substring
    search, geo radius, bulk update) N times and charts the best latency per
-   engine with a speed-up column.
-5. **Notes tab** — a written summary of the strengths and weaknesses the
+   engine with a speed-up column. Both engines run the same 8 operations; the
+   `how` column says how each engine executes them. The bulk update leaves the
+   data unchanged (rolled back in PostgreSQL, a scratch field removed in
+   MongoDB).
+6. **Notes tab** — a written summary of the strengths and weaknesses the
    prototype demonstrates.
 
 ## 5. Data model
@@ -146,14 +163,39 @@ compound `{block.town, resale_price}`, `block.street_name`, `block.block_id`,
 `block.nearest.mrt.distance_m`, and a **`2dsphere`** index on `block.location`.
 An optional `$jsonSchema` validator enforces required fields / positive prices.
 
+### MongoDB (user data, database `hdb_users`)
+
+Kept in a separate database because reloading the CSV drops `hdb` entirely.
+Each collection has a `$jsonSchema` validator (weights must be integers 0–100).
+
+```jsonc
+// users            — unique index on name
+{ "name": "Matthias", "weights": { "afford": 70, "mrt": 60, "school": 40,
+  "hawker": 40, "park": 30, "cbd": 20, "lease": 50 },
+  "filters": { "towns": ["BISHAN"], "flat_types": ["4 ROOM"],
+               "budget_max": 800000, "months_back": 12, ... },
+  "created_at": ISODate, "updated_at": ISODate }
+
+// saved_searches   — index {user, created_at desc}
+{ "user": "Matthias", "name": "Near my parents", "weights": {...},
+  "filters": {...}, "created_at": ISODate }
+
+// search_history   — index {user, searched_at desc}
+{ "user": "Matthias", "weights": {...}, "filters": {...}, "result_count": 50,
+  "top_transaction_ids": ["TX_..."],   // PostgreSQL ids, referenced by value
+  "searched_at": ISODate }
+```
+
 ## 6. Project layout
 
 ```
 Project/
-├─ app.py                 Streamlit GUI (all 5 tabs)
+├─ app.py                 Streamlit GUI (all 6 tabs)
 ├─ config.py              connection strings + paths (edit here)
 ├─ requirements.txt
 ├─ run_app.ps1            start PG (if needed) + launch Streamlit
+├─ .streamlit/config.toml theme: colours, fonts, sidebar, chart palette
+├─ assets/style.css       styles for the banner, result cards, timing badges
 ├─ scripts/
 │  ├─ pg_setup.ps1        one-time initdb + createdb
 │  ├─ pg_start.ps1 / pg_stop.ps1
@@ -161,6 +203,7 @@ Project/
 │  ├─ cleaning.py         CSV -> typed frame -> normalized tables / documents
 │  ├─ pg.py               PgRepo: schema, COPY load, CRUD, filter, benchmark
 │  ├─ mongo.py            MongoRepo: schema+indexes, load, CRUD, filter, benchmark
+│  ├─ prefs.py            PrefsRepo: user profiles, saved searches, history
 │  ├─ loader.py           run_load(): orchestrates both, collects timings
 │  └─ timing.py           stopwatch helpers
 └─ vendor/pgsql/          portable PostgreSQL 16 binaries

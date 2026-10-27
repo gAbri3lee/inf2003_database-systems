@@ -3,3 +3,5 @@ pandas>=2.2
 pymongo>=4.10
 psycopg[binary]>=3.2
 python-dotenv>=1.0
+altair>=5
+pydeck>=0.9

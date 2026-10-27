@@ -15,7 +15,6 @@ Plus CHECK constraints, foreign keys, and two VIEWs used by the GUI.
 """
 from __future__ import annotations
 
-import datetime as dt
 from contextlib import contextmanager
 
 import pandas as pd
@@ -147,7 +146,7 @@ CREATE VIEW v_transactions_full AS
 SELECT t.transaction_id, t.month, tw.name AS town, t.flat_type,
        fm.name AS flat_model, t.storey_range, t.floor_area_sqm,
        t.resale_price, t.price_per_sqm, t.remaining_lease,
-       t.lease_commence_year,
+       t.remaining_lease_months, t.lease_commence_year,
        b.block_id, b.block_no, b.street_name, b.property_address, b.postal_code,
        b.latitude, b.longitude,
        s.name AS nearest_mrt, b.distance_to_mrt_m,
@@ -190,6 +189,21 @@ HAVERSINE = """
     POWER(SIN(RADIANS(longitude - %(lon)s) / 2), 2)
 ))
 """
+
+SORT_COLUMNS = {"resale_price", "month", "price_per_sqm", "floor_area_sqm"}
+
+# Compatibility-score factors for score_flats(): key -> (view column,
+# lower_is_better). Affordability is ranked within the same flat type so a
+# 3-room isn't "cheap" just because it's smaller than a 5-room.
+SCORE_FACTORS = {
+    "afford": ("resale_price", True),
+    "mrt":    ("distance_to_mrt_m", True),
+    "school": ("distance_to_pri_school_m", True),
+    "hawker": ("hawker_distance_m", True),
+    "park":   ("park_distance_m", True),
+    "cbd":    ("distance_to_cbd_m", True),
+    "lease":  ("remaining_lease_months", False),
+}
 
 
 def _scalar(v):
@@ -278,6 +292,18 @@ class PgRepo:
                 out[tbl] = c.execute(f"SELECT COUNT(*) AS n FROM {tbl}").fetchone()["n"]
         return out
 
+    def summary(self):
+        """Headline numbers for the GUI banner, in one round trip."""
+        with self.conn(autocommit=True) as c, stopwatch("summary counts", "postgres") as t:
+            row = c.execute(
+                "SELECT (SELECT COUNT(*) FROM transactions) AS n,"
+                "       (SELECT MIN(month) FROM transactions) AS lo,"
+                "       (SELECT MAX(month) FROM transactions) AS hi,"
+                "       (SELECT COUNT(*) FROM towns) AS towns,"
+                "       (SELECT COUNT(*) FROM blocks) AS blocks"
+            ).fetchone()
+        return row, t
+
     def distinct(self, column: str, table: str = "v_transactions_full") -> list:
         with self.conn(autocommit=True) as c:
             rows = c.execute(
@@ -299,9 +325,12 @@ class PgRepo:
         return [r["transaction_id"] for r in rows]
 
     # -------------------------------------------------- CRUD -------------- #
+    # The connection is opened *before* each stopwatch starts: MongoRepo reuses
+    # a pooled client, so timing a fresh connect + SCRAM login here would make
+    # every PostgreSQL CRUD/filter number look slower than the query really is.
     def get_transaction(self, txn_id: str):
-        with stopwatch("read (indexed PK + 7 joins)", "postgres") as t, \
-                self.conn(autocommit=True) as c:
+        with self.conn(autocommit=True) as c, \
+                stopwatch("read (indexed PK + 7 joins)", "postgres") as t:
             rows = c.execute(
                 "SELECT * FROM v_transactions_full WHERE transaction_id = %s",
                 (txn_id,),
@@ -310,8 +339,8 @@ class PgRepo:
         return rows, t
 
     def create_transaction(self, data: dict):
-        with stopwatch("create (1 row, FK + CHECK enforced)", "postgres") as t, \
-                self.conn() as c:
+        with self.conn() as c, \
+                stopwatch("create (1 row, FK + CHECK enforced)", "postgres") as t:
             model_id = None
             if data.get("flat_model"):
                 r = c.execute(
@@ -347,8 +376,8 @@ class PgRepo:
 
     def update_transaction(self, txn_id: str, fields: dict):
         sets = ", ".join(f"{k} = %({k})s" for k in fields)
-        with stopwatch(f"update ({len(fields)} field/s)", "postgres") as t, \
-                self.conn() as c:
+        with self.conn() as c, \
+                stopwatch(f"update ({len(fields)} field/s)", "postgres") as t:
             cur = c.execute(
                 f"UPDATE transactions SET {sets} WHERE transaction_id = %(id)s",
                 {**fields, "id": txn_id},
@@ -359,7 +388,7 @@ class PgRepo:
         return t
 
     def delete_transaction(self, txn_id: str):
-        with stopwatch("delete (1 row)", "postgres") as t, self.conn() as c:
+        with self.conn() as c, stopwatch("delete (1 row)", "postgres") as t:
             n = c.execute(
                 "DELETE FROM transactions WHERE transaction_id = %s", (txn_id,)
             ).rowcount
@@ -401,6 +430,8 @@ class PgRepo:
             where.append(f"({HAVERSINE.strip()}) <= %(radius)s")
 
         sort_by = p.get("sort_by") or "resale_price"
+        if sort_by not in SORT_COLUMNS:  # interpolated into SQL below
+            sort_by = "resale_price"
         sort_dir = "DESC" if p.get("sort_desc", True) else "ASC"
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         query = (
@@ -408,7 +439,7 @@ class PgRepo:
             f"ORDER BY {sort_by} {sort_dir}\nLIMIT {int(limit)}"
         )
         self._last_query, self._last_params = query, params
-        with stopwatch("filter query", "postgres") as t, self.conn(autocommit=True) as c:
+        with self.conn(autocommit=True) as c, stopwatch("filter query", "postgres") as t:
             rows = c.execute(query, params).fetchall()
         t.rows = len(rows)
         return rows, t, query
@@ -427,6 +458,85 @@ class PgRepo:
         except Exception as e:  # pragma: no cover
             return f"(EXPLAIN unavailable: {e})"
 
+    # -------------------------------------------------- compatibility score #
+    def score_flats(self, f: dict, weights: dict, limit: int = 50):
+        """Rank recent sales by a weighted, explainable compatibility score.
+
+        Every factor becomes a 0-100 percentile against *all* sales in the time
+        window (so 85 on MRT means "closer to an MRT than 85% of flats sold"),
+        then the user's filters are applied and the weighted average is taken.
+        """
+        total = sum(int(weights.get(k, 0)) for k in SCORE_FACTORS)
+        if total <= 0:
+            raise ValueError("At least one priority weight must be above 0.")
+
+        subscores = []
+        for key, (col, lower_is_better) in SCORE_FACTORS.items():
+            partition = "PARTITION BY flat_type " if key == "afford" else ""
+            # NULLS FIRST -> rank 0 -> a missing value scores 0, never 100.
+            direction = "DESC" if lower_is_better else "ASC"
+            subscores.append(
+                f"ROUND((100 * PERCENT_RANK() OVER "
+                f"({partition}ORDER BY {col} {direction} NULLS FIRST))::numeric, 1) AS s_{key}"
+            )
+        subscore_sql = ",\n           ".join(subscores)
+
+        params: dict = {f"w_{k}": int(weights.get(k, 0)) for k in SCORE_FACTORS}
+        params["w_total"] = total
+        weighted = " + ".join(f"s_{k} * %(w_{k})s" for k in SCORE_FACTORS)
+
+        pool_where = ""
+        if f.get("months_back"):
+            # relative to the newest sale in the data, not today's date
+            pool_where = ("WHERE month > (SELECT MAX(month) FROM transactions)"
+                          " - make_interval(months => %(months_back)s)")
+            params["months_back"] = int(f["months_back"])
+
+        where = []
+        if f.get("towns"):
+            where.append("town = ANY(%(towns)s)"); params["towns"] = list(f["towns"])
+        if f.get("flat_types"):
+            where.append("flat_type = ANY(%(fts)s)"); params["fts"] = list(f["flat_types"])
+        if f.get("budget_max") is not None:
+            where.append("resale_price <= %(budget)s"); params["budget"] = f["budget_max"]
+        if f.get("area_min"):
+            where.append("floor_area_sqm >= %(amin)s"); params["amin"] = f["area_min"]
+        if f.get("lease_min_years"):
+            where.append("remaining_lease_months >= %(lmin)s")
+            params["lmin"] = int(f["lease_min_years"]) * 12
+        user_where = ("WHERE " + " AND ".join(where)) if where else ""
+
+        if f.get("one_per_block", True):
+            final = ("SELECT * FROM (\n"
+                     "    SELECT DISTINCT ON (block_id) * FROM ranked\n"
+                     "    ORDER BY block_id, score DESC, month DESC\n"
+                     ") best\n")
+        else:
+            final = "SELECT * FROM ranked\n"
+
+        query = (
+            "WITH pool AS (\n"
+            "    SELECT * FROM v_transactions_full\n"
+            f"    {pool_where}\n"
+            "), scored AS (\n"
+            "    SELECT pool.*, COUNT(*) OVER () AS pool_size,\n"
+            f"           {subscore_sql}\n"
+            "    FROM pool\n"
+            "), ranked AS (\n"
+            "    SELECT scored.*,\n"
+            f"           ROUND(({weighted})::numeric / %(w_total)s, 1) AS score\n"
+            "    FROM scored\n"
+            f"    {user_where}\n"
+            ")\n"
+            f"{final}ORDER BY score DESC, resale_price\n"
+            f"LIMIT {int(limit)}"
+        )
+        with self.conn(autocommit=True) as c, \
+                stopwatch("compatibility score (view + 7 window functions)", "postgres") as t:
+            rows = c.execute(query, params).fetchall()
+        t.rows = len(rows)
+        return rows, t, query
+
     # -------------------------------------------------- benchmark -------- #
     def benchmark(self, repeat: int = 5) -> list[Timing]:
         results: list[Timing] = []
@@ -442,7 +552,9 @@ class PgRepo:
                 "WHERE latitude IS NOT NULL LIMIT 1"
             ).fetchone()
 
-            def run(label, query, params=None, count_row=False):
+            # Labels must match MongoRepo.benchmark exactly: the GUI pairs the
+            # two engines by label. Engine-specific detail goes in extra["how"].
+            def run(label, how, query, params=None, count_row=False):
                 best = None
                 data = []
                 for _ in range(repeat):
@@ -454,43 +566,49 @@ class PgRepo:
                     rows = int(first) if first is not None else 0
                 else:
                     rows = len(data)
-                results.append(Timing(label=label, engine="postgres", ms=best, rows=rows))
+                results.append(Timing(label=label, engine="postgres", ms=best,
+                                      rows=rows, extra={"how": how}))
 
             if pid:
-                run("point lookup by PK", "SELECT * FROM transactions WHERE transaction_id = %(id)s",
+                run("point lookup by id", "primary-key index on transactions",
+                    "SELECT * FROM transactions WHERE transaction_id = %(id)s",
                     {"id": pid})
-            run("indexed range scan (price BETWEEN)",
+            run("indexed range scan (price BETWEEN)", "B-tree index on resale_price",
                 "SELECT COUNT(*) AS n, AVG(resale_price) FROM transactions "
                 "WHERE resale_price BETWEEN %(lo)s AND %(hi)s",
                 {"lo": price_lo, "hi": price_hi}, count_row=True)
-            run("aggregate group-by town (2 joins)",
+            run("aggregate group-by town", "2 joins + hash aggregate",
                 "SELECT tw.name, COUNT(*), ROUND(AVG(t.resale_price),0) "
                 "FROM transactions t JOIN blocks b ON b.block_id=t.block_id "
                 "JOIN towns tw ON tw.town_id=b.town_id GROUP BY tw.name")
-            run("monthly price trend (group-by month)",
+            run("monthly price trend (group-by month)", "hash aggregate on transactions",
                 "SELECT month, COUNT(*), ROUND(AVG(resale_price),0) "
                 "FROM transactions GROUP BY month ORDER BY month")
-            run("join-heavy top-20 (7-table view)",
+            run("top-20 by price in one town", "8-table view, then sort",
                 "SELECT * FROM v_transactions_full WHERE town = %(t)s "
                 "ORDER BY resale_price DESC LIMIT 20", {"t": some_town})
-            run("substring search (street ILIKE)",
+            run("substring search on street", "ILIKE over the ~10k-row blocks table",
                 "SELECT COUNT(*) AS n FROM blocks WHERE street_name ILIKE %(q)s",
                 {"q": "%TAMPINES%"}, count_row=True)
             if centre:
-                run("geo radius 1km (haversine, no PostGIS)",
+                run("geo radius 1 km", "haversine scan of blocks (no PostGIS)",
                     f"SELECT COUNT(*) AS n FROM blocks WHERE latitude IS NOT NULL AND "
                     f"({HAVERSINE.strip()}) <= 1000",
                     {"lat": centre["lat"], "lon": centre["lon"]}, count_row=True)
-            # bulk update, rolled back so the benchmark stays repeatable
+            # bulk update inside a transaction, rolled back (untimed) after each
+            # repetition so the data is unchanged and every repetition really writes
+            label = "bulk update (recompute price/sqm)"
+            best, n = None, 0
             with self.conn() as wc:
                 for _ in range(repeat):
-                    with stopwatch("bulk update + rollback (recompute psm)", "postgres") as t:
+                    with stopwatch(label, "postgres") as t:
                         n = wc.execute(
                             "UPDATE transactions SET price_per_sqm = "
                             "ROUND((resale_price / floor_area_sqm)::numeric, 2) "
                             "WHERE flat_type = %(ft)s", {"ft": "4 ROOM"}
                         ).rowcount
-                        wc.rollback()
-                results.append(Timing("bulk update + rollback (recompute psm)",
-                                      ms=t.ms, rows=n, engine="postgres"))
+                    wc.rollback()
+                    best = t.ms if best is None else min(best, t.ms)
+            results.append(Timing(label, ms=best, rows=n, engine="postgres",
+                                  extra={"how": "UPDATE in a transaction, rolled back"}))
         return results

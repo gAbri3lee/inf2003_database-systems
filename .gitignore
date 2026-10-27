@@ -12,6 +12,7 @@ venv/
 # Downloaded dependencies and generated database state
 vendor/
 pgdata/
+mongodata/
 
 # Runtime output
 *.log

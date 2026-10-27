@@ -15,10 +15,6 @@ from psycopg.conninfo import make_conninfo
 PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(PROJECT_DIR / ".env")
 
-VENDOR_DIR = PROJECT_DIR / "vendor"
-PG_BIN_DIR = VENDOR_DIR / "pgsql" / "bin"
-PG_DATA_DIR = PROJECT_DIR / "pgdata"
-
 # The trimmed source CSV ships in the project folder. Override with the
 # HDB_CSV environment variable or the sidebar field in the GUI.
 DEFAULT_CSV = PROJECT_DIR / "HDB_Compass_trimmed_updated.csv"
@@ -45,7 +41,6 @@ def pg_dsn(dbname: str | None = None) -> str:
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017/")
 MONGO_DB = os.environ.get("MONGO_DB", "hdb")
 MONGO_COLLECTION = "transactions"
-
-# --- Loader knobs ------------------------------------------------------------
-PG_COPY_PAGE = 10_000          # rows per COPY flush
-MONGO_BATCH = 5_000            # docs per insert_many
+# User profiles / saved searches / history. A separate database because a
+# data reload drops MONGO_DB entirely.
+MONGO_USER_DB = os.environ.get("MONGO_USER_DB", "hdb_users")
