@@ -232,7 +232,11 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
         )
     )
 
-    df["postal_code"] = df["postal_code"].where(df["postal_code"].notna(), None)
+    # Singapore postal codes are always 6 digits; the CSV drops leading zeros
+    df["postal_code"] = (
+        df["postal_code"].astype("string").str.strip().str.zfill(6)
+        .astype(object).where(df["postal_code"].notna(), None)
+    )
 
     # a handful of rows have no usable price / area - drop them so the
     # relational CHECK constraints (resale_price > 0, floor_area_sqm > 0) hold.
