@@ -21,6 +21,7 @@ from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
 from pymongo.errors import OperationFailure
 
 from .timing import stopwatch, Timing
+from .query_utils import EARTH_RADIUS_M
 
 VALIDATOR = {
     "$jsonSchema": {
@@ -207,7 +208,7 @@ class MongoRepo:
             q["block.location"] = {
                 "$geoWithin": {
                     "$centerSphere": [[np_["lon"], np_["lat"]],
-                                     np_["radius_m"] / 6_378_137.0]
+                                     np_["radius_m"] / EARTH_RADIUS_M]
                 }
             }
         return q
@@ -217,7 +218,7 @@ class MongoRepo:
         sort_field = SORT_FIELD.get(p.get("sort_by") or "resale_price", "resale_price")
         direction = DESCENDING if p.get("sort_desc", True) else ASCENDING
         with stopwatch("filter query", "mongodb") as t:
-            docs = list(self.coll.find(q).sort(sort_field, direction).limit(int(limit)))
+            docs = list(self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(int(limit)))
         t.rows = len(docs)
         self._last_find = (q, sort_field, direction, int(limit))
         return docs, t, q
@@ -227,7 +228,7 @@ class MongoRepo:
         if getattr(self, "_last_find", None) is None:
             return {"note": "run a filter first"}
         q, sort_field, direction, limit = self._last_find
-        cursor = self.coll.find(q).sort(sort_field, direction).limit(limit)
+        cursor = self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(limit)
         return cursor.explain().get("executionStats", {})
 
     # -------------------------------------------------- benchmark ------- #
@@ -235,10 +236,10 @@ class MongoRepo:
         results: list[Timing] = []
         ids = self.sample_ids(20)
         pid = ids[0] if ids else None
-        town_doc = self.coll.find_one({}, {"block.town": 1})
+        town_doc = self.coll.find_one({}, {"block.town": 1}, sort=[('block.town', ASCENDING)])
         some_town = town_doc["block"]["town"] if town_doc else None
         centre_doc = self.coll.find_one({"block.location": {"$ne": None}},
-                                       {"block.location": 1})
+                                       {"block.location": 1}, sort=[('block.block_id', ASCENDING)])
         centre = centre_doc["block"]["location"]["coordinates"] if centre_doc else None
 
         # Labels must match PgRepo.benchmark exactly: the GUI pairs the two
@@ -279,12 +280,14 @@ class MongoRepo:
             lambda: _agg_count(
                 self.coll, [{"$match": {"block.street_name": {"$regex": "TAMPINES",
                                                               "$options": "i"}}},
+                            {"$group": {"_id": "$block.block_id"}},
                             {"$count": "n"}]))
         if centre:
             run("geo radius 1 km", "2dsphere index, $geoWithin",
-                lambda: self.coll.count_documents(
-                    {"block.location": {"$geoWithin": {"$centerSphere": [
-                        centre, 1000 / 6_378_137.0]}}}))
+                lambda: _agg_count(self.coll, [
+                    {"$match": {"block.location": {"$geoWithin": {"$centerSphere": [
+                        centre, 1000 / EARTH_RADIUS_M]}}}},
+                    {"$group": {"_id": "$block.block_id"}}, {"$count": "n"}]))
         # A standalone mongod has no multi-document rollback, so write the
         # recomputed value into a scratch field and $unset it afterwards. The
         # value changes every repetition: otherwise MongoDB skips the no-op

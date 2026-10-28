@@ -30,7 +30,10 @@ python -m pip install --user -r requirements.txt
 
 ## 2. One-time setup — portable PostgreSQL
 
-The portable binaries were downloaded to `vendor\pgsql` (from EnterpriseDB).
+Portable binaries and CSV data are not included in Git. Download the Windows
+PostgreSQL 16 binary ZIP from [EnterpriseDB](https://www.enterprisedb.com/download-postgresql-binaries)
+and extract it so `vendor\pgsql\bin\pg_ctl.exe` exists. Supply your actual
+`HDB_Compass_trimmed_updated.csv` separately or set `HDB_CSV` to its path.
 Initialise and start the local cluster:
 
 ```powershell
@@ -98,7 +101,11 @@ Streamlit opens `http://localhost:8501`.
    `how` column says how each engine executes them. The bulk update leaves the
    data unchanged (rolled back in PostgreSQL, a scratch field removed in
    MongoDB).
-6. **Notes tab** — a written summary of the strengths and weaknesses the
+6. **Quick search tab** — ten canned aggregate, distance, historical-price,
+   storey-premium and model-exclusion queries, available on either engine or both.
+   Distance limits use unrounded metres; displayed values are rounded afterwards.
+   The model exclusion is not a determination of buyer eligibility.
+7. **Notes tab** — a written summary of the strengths and weaknesses the
    prototype demonstrates.
 
 ## 5. Data model
@@ -190,7 +197,7 @@ Each collection has a `$jsonSchema` validator (weights must be integers 0–100)
 
 ```
 Project/
-├─ app.py                 Streamlit GUI (all 6 tabs)
+├─ app.py                 Streamlit GUI (all 7 tabs)
 ├─ config.py              connection strings + paths (edit here)
 ├─ requirements.txt
 ├─ run_app.ps1            start PG (if needed) + launch Streamlit
@@ -219,3 +226,37 @@ Project/
 * **Reload from scratch** → just click *Build schema + load CSV* again; both
   sides are dropped and recreated.
 * **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.
+
+
+## 8. Automated checks
+
+The merged application has regression tests using **controlled synthetic data**,
+not actual resale records. They cover all ten Quick Search query pairs, literal
+substring and distance boundaries, rounding parity, loading/projection, CRUD,
+ranking, profiles/history, schema reloads and benchmark result counts. Streamlit's
+AppTest runs all seven tabs and exercises Find a flat and all ten quick searches.
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Real database tests require an empty dedicated PostgreSQL database whose name
+starts with `hdb_test_` and a test MongoDB server. The tests rebuild the named
+PostgreSQL database's application tables and MongoDB `hdb_test_*` databases.
+Never point these settings at a production database.
+
+```powershell
+$env:TEST_PG_DSN = 'host=127.0.0.1 port=55433 user=hdb_test dbname=hdb_test_merge'
+$env:TEST_MONGO_URI = 'mongodb://127.0.0.1:57017/'
+python -m pytest -q
+```
+
+Without those settings, database/UI tests are explicitly skipped. GitHub Actions
+starts disposable PostgreSQL 16 and MongoDB 8 services and runs the complete suite.
+Both engines use the same Earth radius and count distinct blocks for the block-level
+substring/geographic benchmarks. Quick-search timings exclude PostgreSQL connection
+setup, and both engines round displayed aggregates with ties away from zero.
+
+Actual CSV loading and performance at production data volumes still need validation
+with your supplied CSV; the synthetic tests do not establish those results.

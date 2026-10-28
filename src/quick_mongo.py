@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from decimal import Decimal, ROUND_HALF_UP
 
 from .mongo import MongoRepo, _as_dt
 from .quick import MULTIGEN, METRICS, months_ago, plain_row, window_params
@@ -62,7 +63,25 @@ def _limit(limit) -> list:
     return [{"$limit": int(limit)}] if limit else []
 
 
+def _sql_rounds(value):
+    """Use PostgreSQL numeric rounding (ties away from zero), not Mongo ties-to-even."""
+    if isinstance(value, list):
+        return [_sql_rounds(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value)=={'$round'}:
+        expr,places=value['$round']
+        scale=10**places
+        scaled={'$multiply':[{'$toDecimal':_sql_rounds(expr)},scale]}
+        rounded={'$cond':[{'$gte':[scaled,0]},
+            {'$floor':{'$add':[scaled,0.5]}},
+            {'$ceil':{'$subtract':[scaled,0.5]}}]}
+        return {'$toDouble':{'$divide':[rounded,scale]}}
+    return {k:_sql_rounds(v) for k,v in value.items()}
+
+
 def _run(repo: MongoRepo, label: str, pipeline: list, post=None):
+    pipeline=_sql_rounds(pipeline)
     with stopwatch(label, "mongodb") as t:
         rows = list(repo.coll.aggregate(pipeline, allowDiskUse=True))
         if post:
@@ -224,9 +243,10 @@ def floor_premium(repo, p, limit=None):
         prev_town, prev = None, None
         for r in rows:
             r["increase_vs_prev_range"] = (
-                round(r["avg_price"] - prev) if r["town"] == prev_town else None)
+                float((Decimal(str(r["avg_price"])) - Decimal(str(prev))).quantize(
+                    Decimal('1'), rounding=ROUND_HALF_UP)) if r["town"] == prev_town else None)
             prev_town, prev = r["town"], r["avg_price"]
-            r["avg_price"] = round(r["avg_price"])
+            r["avg_price"] = float(Decimal(str(r["avg_price"])).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
         return rows[:int(limit)] if limit else rows
 
     pipe = [

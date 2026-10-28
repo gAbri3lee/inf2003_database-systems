@@ -164,7 +164,7 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
     # Strip before deriving IDs so a stray trailing space can't split one
     # block (or hawker/park) into two surrogate IDs.
     for col in df.columns:
-        if df[col].dtype == object:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
             df[col] = df[col].str.strip()
 
     # The CSV stores postal codes as floats ("570192.0"), which also drops the

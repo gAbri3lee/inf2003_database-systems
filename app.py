@@ -1094,9 +1094,8 @@ with tab_quick:
             _quick_run(qid, p, qe, int(lim))
 
     elif qid == "recent_prices":
-        st.caption("Resale prices from the last N years. Flats bought less than 5 "
-                   "years ago are still inside the Minimum Occupation Period; switch "
-                   "to *older than* to see owners who could already sell.")
+        st.caption("Compare transactions within or before the selected time window. "
+                   "Transaction history does not establish a current owner's eligibility to sell.")
         p = _quick_filters("q5", area=True)
         c1, c2, c3, c4 = st.columns(4)
         p["window"] = "older" if c1.radio(
@@ -1124,7 +1123,7 @@ with tab_quick:
     elif qid == "distance_band":
         st.caption(f"Blocks grouped by how far the nearest amenity is. Walking "
                    f"time assumes ~{quick.WALK_M_PER_MIN} m/min (≈ 4.8 km/h) over "
-                   f"straight-line distance, so real routes are a little longer.")
+                   f"straight-line distance. Actual routes and travel times can differ substantially.")
         c1, c2 = st.columns(2)
         metric = c1.selectbox("Nearest…", list(quick.METRICS), key="q7_metric")
         bands = QUICK_BANDS[metric]
@@ -1156,10 +1155,9 @@ with tab_quick:
             _quick_run(qid, p, qe)
 
     elif qid == "singles":
-        st.caption("HDB lets singles buy any resale flat except Multi-Generation. "
-                   "PostgreSQL reads the `v_singles_resale` view (created on first "
-                   "run) which already excludes 3Gen; MongoDB applies the same "
-                   "exclusion as a `$match`. Distances in km.")
+        st.caption("Explore sales excluding 3Gen and Multi-Generation models. "
+                   "PostgreSQL uses `v_singles_resale`; MongoDB applies the same "
+                   "exclusion. This model filter is not a buyer-eligibility check. Distances in km.")
         p = _quick_filters("q10", models=False, storey=False, months=True)
         c1, c2, c3 = st.columns(3)
         p["max_mrt_km"] = c1.number_input("Max km to MRT (0 = any)", 0.0, 20.0, 0.0,

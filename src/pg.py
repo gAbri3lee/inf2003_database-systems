@@ -23,6 +23,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from .timing import stopwatch, Timing
+from .query_utils import EARTH_RADIUS_M, escape_like
 
 # ------------------------------------------------------------------ DDL ------ #
 SCHEMA_SQL = r"""
@@ -182,8 +183,8 @@ LOAD_ORDER = [
     "hawkers", "parks", "schools", "blocks", "transactions",
 ]
 
-HAVERSINE = """
-6371000 * 2 * ASIN(SQRT(
+HAVERSINE = f"""
+{EARTH_RADIUS_M} * 2 * ASIN(SQRT(
     POWER(SIN(RADIANS(latitude  - %(lat)s) / 2), 2) +
     COS(RADIANS(%(lat)s)) * COS(RADIANS(latitude)) *
     POWER(SIN(RADIANS(longitude - %(lon)s) / 2), 2)
@@ -423,7 +424,7 @@ class PgRepo:
             where.append("distance_to_mrt_m <= %(dmrt)s"); params["dmrt"] = p["max_dist_mrt"]
         if p.get("street_like"):
             where.append("street_name ILIKE %(slike)s")
-            params["slike"] = f"%{p['street_like']}%"
+            params["slike"] = f"%{escape_like(p['street_like'])}%"
         if p.get("near_point"):
             np_ = p["near_point"]
             params.update(lat=np_["lat"], lon=np_["lon"], radius=np_["radius_m"])
@@ -436,7 +437,7 @@ class PgRepo:
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         query = (
             f"SELECT * FROM v_transactions_full\n{where_sql}\n"
-            f"ORDER BY {sort_by} {sort_dir}\nLIMIT {int(limit)}"
+            f"ORDER BY {sort_by} {sort_dir}, transaction_id\nLIMIT {int(limit)}"
         )
         self._last_query, self._last_params = query, params
         with self.conn(autocommit=True) as c, stopwatch("filter query", "postgres") as t:
@@ -545,11 +546,11 @@ class PgRepo:
         with self.conn(autocommit=True) as c:
             price_lo, price_hi = 400000, 650000
             some_town = c.execute(
-                "SELECT name FROM towns ORDER BY town_id LIMIT 1"
+                "SELECT name FROM towns ORDER BY name LIMIT 1"
             ).fetchone()["name"]
             centre = c.execute(
                 "SELECT latitude AS lat, longitude AS lon FROM blocks "
-                "WHERE latitude IS NOT NULL LIMIT 1"
+                "WHERE latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY block_id LIMIT 1"
             ).fetchone()
 
             # Labels must match MongoRepo.benchmark exactly: the GUI pairs the

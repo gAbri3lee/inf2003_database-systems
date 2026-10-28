@@ -22,10 +22,11 @@ from psycopg import sql
 
 from .pg import PgRepo
 from .timing import stopwatch
+from .query_utils import escape_like
 
 # average adult walking speed ~ 4.8 km/h = 80 m/min (straight-line distance)
 WALK_M_PER_MIN = 80
-MULTIGEN = "multi.?gen"          # HDB: every flat model except 3Gen may be resold to singles
+MULTIGEN = "(3[ -]?gen|multi[ -]?gen)"
 
 # nearest-amenity columns used by the distance-band query
 METRICS = {
@@ -125,7 +126,7 @@ def limit_clause(limit) -> str:
 
 
 def _run(repo: PgRepo, label: str, query: str):
-    with stopwatch(label, "postgres") as t, repo.conn(autocommit=True) as c:
+    with repo.conn(autocommit=True) as c, stopwatch(label, "postgres") as t:
         rows = c.execute(query).fetchall()
     t.rows = len(rows)
     return [plain_row(r) for r in rows], t, query
@@ -172,7 +173,7 @@ def txn_count(repo, p, limit=200):
     """3. How many transactions per address."""
     conds = txn_conditions(p)
     if p.get("address_like"):
-        conds.append(f"b.property_address ILIKE {lit('%' + p['address_like'] + '%')}")
+        conds.append(f"b.property_address ILIKE {lit('%' + escape_like(p['address_like']) + '%')}")
     q = f"""
 SELECT b.property_address, tw.name AS town,
        COUNT(*)     AS transactions,
@@ -223,7 +224,7 @@ def lease_by_postal(repo, p, limit=200):
     conds = ["b.postal_code IS NOT NULL", "t.remaining_lease_months IS NOT NULL",
              *txn_conditions(p)]
     if p.get("postal_prefix"):
-        conds.append(f"b.postal_code LIKE {lit(p['postal_prefix'] + '%')}")
+        conds.append(f"b.postal_code LIKE {lit(escape_like(p['postal_prefix']) + '%')}")
     q = f"""
 SELECT b.postal_code,
        MIN(tw.name)                  AS town,
@@ -314,7 +315,9 @@ SELECT t.transaction_id, t.month, tw.name AS town, b.block_id,
        t.remaining_lease_months,
        s.name AS nearest_mrt,
        ROUND((b.distance_to_mrt_m / 1000.0)::numeric, 2) AS mrt_km,
-       ROUND((b.bus_distance_m    / 1000.0)::numeric, 2) AS bus_km
+       ROUND((b.bus_distance_m    / 1000.0)::numeric, 2) AS bus_km,
+       b.distance_to_mrt_m AS mrt_distance_m,
+       b.bus_distance_m
 FROM   transactions t
 JOIN   blocks b            ON b.block_id    = t.block_id
 JOIN   towns  tw           ON tw.town_id    = b.town_id
@@ -338,9 +341,9 @@ def singles(repo, p, limit=200):
     if p.get("month_to"):
         conds.append(f"month <= {lit(p['month_to'])}")
     if p.get("max_mrt_km") is not None:
-        conds.append(f"mrt_km <= {lit(p['max_mrt_km'])}")
+        conds.append(f"mrt_distance_m <= {lit(p['max_mrt_km'] * 1000)}")
     if p.get("max_bus_km") is not None:
-        conds.append(f"bus_km <= {lit(p['max_bus_km'])}")
+        conds.append(f"bus_distance_m <= {lit(p['max_bus_km'] * 1000)}")
     q = f"""
 SELECT property_address, town, nearest_mrt,
        MIN(mrt_km)                 AS mrt_km,

@@ -16,6 +16,8 @@ mongodata/
 
 # Runtime output
 *.log
+.pytest_cache/
+test-results.xml
 
 # Local datasets
 *.csv
