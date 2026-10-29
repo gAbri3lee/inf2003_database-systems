@@ -4,7 +4,7 @@ saved searches and search history.
 These are naturally document-shaped (per user, nested filter/weight objects,
 no joins needed), which is why the proposal puts them in MongoDB. They live in
 their own database (``config.MONGO_USER_DB``) because ``MongoRepo.build_schema``
-drops the whole transactions database on every data reload.
+replaces the transactions collection on data reload; separate storage provides additional isolation.
 """
 from __future__ import annotations
 

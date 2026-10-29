@@ -39,8 +39,7 @@ python -m streamlit run app.py
 powershell -ExecutionPolicy Bypass -File scripts\pg_stop.ps1
 ```
 
-There is no test suite, linter, or build step in this repo — it's a Streamlit
-prototype driven interactively through the browser UI at `http://localhost:8501`.
+Run `python -m pytest -q` with TEST_PG_DSN and TEST_MONGO_URI pointing to disposable test databases. The suite includes real database and Streamlit AppTest checks. See README and docs/actual-data-validation.json for full-data verification.
 
 Connection settings (host/port/user/db for both engines, and the CSV path)
 are centralized in [config.py](config.py); override via env vars
@@ -78,8 +77,8 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   DB call in both repos and is the sole source of the millisecond numbers
   shown in the GUI and appended to the sidebar operation log — any new DB
   operation should be wrapped in `stopwatch(label, engine)` to stay consistent.
-* [app.py](app.py) is a single-file Streamlit app with 6 tabs (Find a flat,
-  Overview, CRUD, Filter, Benchmark, Notes) plus a sidebar (connection health,
+* [app.py](app.py) is a single-file Streamlit app with 7 tabs (Find a flat,
+  Overview, CRUD, Filter, Quick search, Benchmark, Notes) plus a sidebar (connection health,
   build/load controls, operation log). `PgRepo`/`MongoRepo`/`PrefsRepo`
   instances are memoized via `@st.cache_resource`; distinct-value lookups for
   filter dropdowns are memoized via `@st.cache_data` and explicitly cleared
@@ -99,8 +98,7 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   `v_transactions_full` (factors in `SCORE_FACTORS`), while
   [src/prefs.py](src/prefs.py) (`PrefsRepo`) stores user profiles, saved
   searches and search history in MongoDB. Those live in a separate database
-  (`MONGO_USER_DB`, default `hdb_users`) because `MongoRepo.build_schema` drops
-  the whole `MONGO_DB` on every reload.
+  (`MONGO_USER_DB`, default `hdb_users`) for isolation. Reloads stage and replace only the transaction collection.
 * The GUI pairs benchmark results across engines **by label**, so each
   operation must have the identical label in `PgRepo.benchmark` and
   `MongoRepo.benchmark`; put engine-specific detail in `Timing.extra["how"]`.

@@ -172,7 +172,7 @@ An optional `$jsonSchema` validator enforces required fields / positive prices.
 
 ### MongoDB (user data, database `hdb_users`)
 
-Kept in a separate database because reloading the CSV drops `hdb` entirely.
+Kept in a separate database for isolation. Reloads replace only the transaction collection.
 Each collection has a `$jsonSchema` validator (weights must be integers 0–100).
 
 ```jsonc
@@ -224,7 +224,7 @@ Project/
   `config.py`, re-run setup.
 * **`MongoDB down`** → `Get-Service MongoDB` and `Start-Service MongoDB`.
 * **Reload from scratch** → just click *Build schema + load CSV* again; both
-  sides are dropped and recreated.
+  projections are rebuilt with rollback/recovery on reported failures.
 * **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.
 
 
