@@ -8,7 +8,9 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # MongoDB 8 cannot start on affected 6.19+ kernels; use the supported 6.8 runner.
+    # https://www.mongodb.com/community/forums/t/mongodb-8-x-and-linux-kernel-6-19/337547
+    runs-on: ubuntu-22.04
     services:
       postgres:
         image: postgres:16

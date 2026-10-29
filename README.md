@@ -309,3 +309,5 @@ python scripts/validate_actual.py "C:\path\to\HDB_Compass_trimmed_updated.csv"
 Set `TEST_PG_DSN` to the dedicated `hdb_test_actual` database and `TEST_MONGO_URI`
 to a test MongoDB server beforehand. The script reconciles all projected records,
 all ten query pairs, six distance metrics, actual-row updates and GUI queries.
+
+CI pins Ubuntu 22.04 to avoid the documented MongoDB 8 incompatibility with certain newer Linux kernels. Docker also uses the host kernel; use a MongoDB-supported kernel if its container refuses startup.
