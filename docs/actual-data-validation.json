@@ -1,0 +1,357 @@
+{
+  "status": "PASS",
+  "source_name": "HDB_Compass_trimmed_updated.csv",
+  "sha256": "c6f4e42f342d23bf73cfcffac258f88c150f9b93f3792d9405eb16ed887c6705",
+  "source_rows": 171924,
+  "valid_transactions": 171923,
+  "rejected_rows": [
+    {
+      "csv_row": 171925,
+      "reason": "Missing/non-positive resale price or floor area"
+    }
+  ],
+  "table_counts": {
+    "towns": 26,
+    "flat_models": 21,
+    "mrt_lines": 7,
+    "mrt_stations": 142,
+    "station_lines": 157,
+    "hawkers": 113,
+    "parks": 228,
+    "schools": 169,
+    "blocks": 9709,
+    "transactions": 171923
+  },
+  "all_sql_values_match": true,
+  "all_mongo_documents_match": true,
+  "all_ten_queries_equal": true,
+  "all_distance_metrics_equal": true,
+  "geographic_filter_equal": true,
+  "coordinate_blocks": 9709,
+  "actual_row_updates_consistent": true,
+  "actual_data_gui_passed": true,
+  "benchmark": [
+    {
+      "label": "point lookup by id",
+      "ms": 0.5029999883845448,
+      "rows": 1,
+      "engine": "postgres",
+      "extra": {
+        "how": "primary-key index on transactions",
+        "samples_ms": [
+          0.693199981469661,
+          0.5029999883845448,
+          0.430900021456182
+        ],
+        "median_ms": 0.5029999883845448,
+        "min_ms": 0.430900021456182,
+        "max_ms": 0.693199981469661,
+        "p95_ms": 0.693199981469661,
+        "stdev_ms": 0.11064242285836434,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "indexed range scan (price BETWEEN)",
+      "ms": 7.264500018209219,
+      "rows": 91339,
+      "engine": "postgres",
+      "extra": {
+        "how": "B-tree index on resale_price",
+        "samples_ms": [
+          8.884099952410907,
+          7.264500018209219,
+          6.855599989648908
+        ],
+        "median_ms": 7.264500018209219,
+        "min_ms": 6.855599989648908,
+        "max_ms": 8.884099952410907,
+        "p95_ms": 8.884099952410907,
+        "stdev_ms": 0.8759195345558075,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "aggregate group-by town",
+      "ms": 52.01790004502982,
+      "rows": 26,
+      "engine": "postgres",
+      "extra": {
+        "how": "2 joins + hash aggregate",
+        "samples_ms": [
+          61.63350003771484,
+          48.9164000027813,
+          52.01790004502982
+        ],
+        "median_ms": 52.01790004502982,
+        "min_ms": 48.9164000027813,
+        "max_ms": 61.63350003771484,
+        "p95_ms": 61.63350003771484,
+        "stdev_ms": 5.4140116470537025,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "monthly price trend (group-by month)",
+      "ms": 46.21480003697798,
+      "rows": 81,
+      "engine": "postgres",
+      "extra": {
+        "how": "hash aggregate on transactions",
+        "samples_ms": [
+          49.67109998688102,
+          46.21480003697798,
+          46.02940002223477
+        ],
+        "median_ms": 46.21480003697798,
+        "min_ms": 46.02940002223477,
+        "max_ms": 49.67109998688102,
+        "p95_ms": 49.67109998688102,
+        "stdev_ms": 1.674725886083751,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "top-20 by price in one town",
+      "ms": 10.350099997594953,
+      "rows": 20,
+      "engine": "postgres",
+      "extra": {
+        "how": "8-table view, then sort",
+        "samples_ms": [
+          17.58949999930337,
+          9.970199957024306,
+          10.350099997594953
+        ],
+        "median_ms": 10.350099997594953,
+        "min_ms": 9.970199957024306,
+        "max_ms": 17.58949999930337,
+        "p95_ms": 17.58949999930337,
+        "stdev_ms": 3.5056616043802817,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "substring search on street",
+      "ms": 2.1380999824032187,
+      "rows": 705,
+      "engine": "postgres",
+      "extra": {
+        "how": "ILIKE over the ~10k-row blocks table",
+        "samples_ms": [
+          3.1685999711044133,
+          1.889800012577325,
+          2.1380999824032187
+        ],
+        "median_ms": 2.1380999824032187,
+        "min_ms": 1.889800012577325,
+        "max_ms": 3.1685999711044133,
+        "p95_ms": 3.1685999711044133,
+        "stdev_ms": 0.5536658073099476,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "geo radius 1 km",
+      "ms": 2.249599958304316,
+      "rows": 122,
+      "engine": "postgres",
+      "extra": {
+        "how": "haversine scan of blocks (no PostGIS)",
+        "samples_ms": [
+          2.597099984996021,
+          2.249599958304316,
+          2.1838999819010496
+        ],
+        "median_ms": 2.249599958304316,
+        "min_ms": 2.1838999819010496,
+        "max_ms": 2.597099984996021,
+        "p95_ms": 2.597099984996021,
+        "stdev_ms": 0.18129380635611894,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "bulk update (recompute price/sqm)",
+      "ms": 2051.1767999851145,
+      "rows": 73717,
+      "engine": "postgres",
+      "extra": {
+        "how": "UPDATE in a transaction, rolled back",
+        "samples_ms": [
+          1700.4401999874972,
+          2051.1767999851145,
+          3236.753300006967
+        ],
+        "median_ms": 2051.1767999851145,
+        "min_ms": 1700.4401999874972,
+        "max_ms": 3236.753300006967,
+        "p95_ms": 3236.753300006967,
+        "stdev_ms": 657.3402417886957,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "point lookup by id",
+      "ms": 0.3470000228844583,
+      "rows": 1,
+      "engine": "mongodb",
+      "extra": {
+        "how": "_id index",
+        "samples_ms": [
+          0.5407999851740897,
+          0.3470000228844583,
+          0.30479999259114265
+        ],
+        "median_ms": 0.3470000228844583,
+        "min_ms": 0.30479999259114265,
+        "max_ms": 0.5407999851740897,
+        "p95_ms": 0.5407999851740897,
+        "stdev_ms": 0.10275930043843577,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "indexed range scan (price BETWEEN)",
+      "ms": 78.04799999576062,
+      "rows": 91339,
+      "engine": "mongodb",
+      "extra": {
+        "how": "index on resale_price + $group",
+        "samples_ms": [
+          78.04799999576062,
+          83.0087999929674,
+          60.26860000565648
+        ],
+        "median_ms": 78.04799999576062,
+        "min_ms": 60.26860000565648,
+        "max_ms": 83.0087999929674,
+        "p95_ms": 83.0087999929674,
+        "stdev_ms": 9.76293043486032,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "aggregate group-by town",
+      "ms": 177.2237000404857,
+      "rows": 26,
+      "engine": "mongodb",
+      "extra": {
+        "how": "$group on embedded block.town (no join)",
+        "samples_ms": [
+          135.847500001546,
+          211.1255000345409,
+          177.2237000404857
+        ],
+        "median_ms": 177.2237000404857,
+        "min_ms": 135.847500001546,
+        "max_ms": 211.1255000345409,
+        "p95_ms": 211.1255000345409,
+        "stdev_ms": 30.782569493260763,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "monthly price trend (group-by month)",
+      "ms": 149.5158999459818,
+      "rows": 81,
+      "engine": "mongodb",
+      "extra": {
+        "how": "$group on month",
+        "samples_ms": [
+          116.28680001012981,
+          149.5158999459818,
+          154.6225999481976
+        ],
+        "median_ms": 149.5158999459818,
+        "min_ms": 116.28680001012981,
+        "max_ms": 154.6225999481976,
+        "p95_ms": 154.6225999481976,
+        "stdev_ms": 16.99635589815596,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "top-20 by price in one town",
+      "ms": 1.8886999459937215,
+      "rows": 20,
+      "engine": "mongodb",
+      "extra": {
+        "how": "compound index {block.town, resale_price}",
+        "samples_ms": [
+          2.1120000164955854,
+          1.8886999459937215,
+          1.7592000076547265
+        ],
+        "median_ms": 1.8886999459937215,
+        "min_ms": 1.7592000076547265,
+        "max_ms": 2.1120000164955854,
+        "p95_ms": 2.1120000164955854,
+        "stdev_ms": 0.14571700188838296,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "substring search on street",
+      "ms": 162.21129999030381,
+      "rows": 705,
+      "engine": "mongodb",
+      "extra": {
+        "how": "$regex over every transaction (block data is repeated per sale)",
+        "samples_ms": [
+          162.21129999030381,
+          151.5155000379309,
+          193.45960003556684
+        ],
+        "median_ms": 162.21129999030381,
+        "min_ms": 151.5155000379309,
+        "max_ms": 193.45960003556684,
+        "p95_ms": 193.45960003556684,
+        "stdev_ms": 17.795642153664875,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "geo radius 1 km",
+      "ms": 31.533900008071214,
+      "rows": 122,
+      "engine": "mongodb",
+      "extra": {
+        "how": "2dsphere index, $geoWithin",
+        "samples_ms": [
+          33.10940001392737,
+          31.533900008071214,
+          31.116400030441582
+        ],
+        "median_ms": 31.533900008071214,
+        "min_ms": 31.116400030441582,
+        "max_ms": 33.10940001392737,
+        "p95_ms": 33.10940001392737,
+        "stdev_ms": 0.8581993703840257,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    },
+    {
+      "label": "bulk update (recompute price/sqm)",
+      "ms": 2780.8244000189006,
+      "rows": 73717,
+      "engine": "mongodb",
+      "extra": {
+        "how": "update_many pipeline into a scratch field, $unset afterwards",
+        "samples_ms": [
+          3370.5307000200264,
+          2371.8938999809325,
+          2780.8244000189006
+        ],
+        "median_ms": 2780.8244000189006,
+        "min_ms": 2371.8938999809325,
+        "max_ms": 3370.5307000200264,
+        "p95_ms": 3370.5307000200264,
+        "stdev_ms": 409.9123392079826,
+        "note": "Measured local sequential query latency; bulk-write rollback strategies differ."
+      }
+    }
+  ],
+  "final_limited_queries_equal": true,
+  "benchmark_gui_passed": true
+}

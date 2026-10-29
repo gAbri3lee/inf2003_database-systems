@@ -101,7 +101,7 @@ def price_extremes(repo, p, limit=None):
         {"$project": {"_id": 0, "town": "$_id", "transactions": "$n",
                       "min_price_per_sqm": "$lo", "max_price_per_sqm": "$hi",
                       "avg_price_per_sqm": {"$round": ["$avg", 0]}}},
-        {"$sort": {"max_price_per_sqm": -1}}, *_limit(limit),
+        {"$sort": {"max_price_per_sqm": -1, "town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: price/sqm extremes by town", pipe)
 
@@ -121,7 +121,7 @@ def mrt_by_town(repo, p, limit=None):
                       "avg_km_to_mrt": {"$round": [{"$divide": ["$avg", 1000]}, 2]},
                       "min_km": {"$round": [{"$divide": ["$lo", 1000]}, 2]},
                       "max_km": {"$round": [{"$divide": ["$hi", 1000]}, 2]}}},
-        {"$sort": {"avg_km_to_mrt": 1}}, *_limit(limit),
+        {"$sort": {"avg_km_to_mrt": 1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: avg MRT distance by town", pipe)
 
@@ -139,7 +139,7 @@ def txn_count(repo, p, limit=200):
         {"$match": {"n": {"$gte": int(p.get("min_count") or 1)}}},
         {"$project": {"_id": 0, "property_address": "$_id.a", "town": "$_id.t",
                       "transactions": "$n", "first_sale": "$first", "last_sale": "$last"}},
-        {"$sort": {"transactions": -1}}, *_limit(limit),
+        {"$sort": {"transactions": -1,"property_address":1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: transactions per address", pipe)
 
@@ -163,7 +163,7 @@ def recent_prices(repo, p, limit=200):
     sort = {"month": "month", "resale_price": "resale_price"}.get(p.get("sort_by"), "month")
     pipe = [
         {"$match": _match(window_params(p))},
-        {"$sort": {sort: -1}}, *_limit(limit),
+        {"$sort": {sort: -1,"_id":1}}, *_limit(limit),
         {"$project": {"_id": 0, "month": 1, "town": "$block.town",
                       "property_address": "$block.property_address",
                       "flat_type": 1, "flat_model": 1, "storey_range": 1,
@@ -239,7 +239,7 @@ def floor_premium(repo, p, limit=None):
     m["storey_range"] = {**m.get("storey_range", {}), "$ne": None}
 
     def post(rows):
-        rows.sort(key=lambda r: (r["town"], int(r["storey_range"].split()[0])))
+        rows.sort(key=lambda r: (r["town"], int(r["storey_range"].split()[0]),r["storey_range"]))
         prev_town, prev = None, None
         for r in rows:
             r["increase_vs_prev_range"] = (
@@ -279,7 +279,7 @@ def singles(repo, p, limit=200):
                       "mrt_km": {"$round": [{"$divide": ["$mrt_d", 1000]}, 2]},
                       "bus_km": {"$round": [{"$divide": ["$bus_d", 1000]}, 2]},
                       "transactions": "$n", "avg_price": {"$round": ["$avg", 0]}}},
-        {"$sort": {"mrt_km": 1, "bus_km": 1}}, *_limit(limit),
+        {"$sort": {"mrt_km": 1, "bus_km": 1,"property_address":1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: singles (no 3Gen)", pipe)
 

@@ -6,6 +6,8 @@ Every database operation in the app is wrapped in ``Timer`` so the GUI can show
 from __future__ import annotations
 
 import time
+import statistics
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -39,3 +41,11 @@ def stopwatch(label: str, engine: str = ""):
         yield t
     finally:
         t.ms = (time.perf_counter() - start) * 1000.0
+
+def benchmark_timing(label,engine,samples,rows,how):
+    return Timing(label=label,engine=engine,ms=statistics.median(samples),rows=rows,
+        extra={'how':how,'samples_ms':samples,'median_ms':statistics.median(samples),
+               'min_ms':min(samples),'max_ms':max(samples),
+               'p95_ms':sorted(samples)[math.ceil(.95*len(samples))-1],
+               'stdev_ms':statistics.pstdev(samples),
+               'note':'Measured local sequential query latency; bulk-write rollback strategies differ.'})

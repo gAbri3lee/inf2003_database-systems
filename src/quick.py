@@ -144,7 +144,7 @@ SELECT tw.name AS town,
 {FROM_TXN}
 {where(txn_conditions(p))}
 GROUP BY tw.name
-ORDER BY max_price_per_sqm DESC
+ORDER BY max_price_per_sqm DESC, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: price/sqm extremes by town", q)
 
@@ -164,7 +164,7 @@ FROM blocks b
 JOIN towns tw ON tw.town_id = b.town_id
 {where(conds)}
 GROUP BY tw.name
-ORDER BY avg_km_to_mrt
+ORDER BY avg_km_to_mrt, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: avg MRT distance by town", q)
 
@@ -183,7 +183,7 @@ SELECT b.property_address, tw.name AS town,
 {where(conds)}
 GROUP BY b.property_address, tw.name
 HAVING COUNT(*) >= {int(p.get('min_count') or 1)}
-ORDER BY transactions DESC
+ORDER BY transactions DESC, property_address, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: transactions per address", q)
 
@@ -214,7 +214,7 @@ SELECT t.month, tw.name AS town, b.property_address,
        t.floor_area_sqm, t.remaining_lease, t.resale_price
 {FROM_TXN}
 {where(txn_conditions(window_params(p)))}
-ORDER BY {sort} DESC
+ORDER BY {sort} DESC, t.transaction_id
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: sales within/older than N years", q)
 
@@ -300,7 +300,7 @@ FROM (
     {where(conds).replace(chr(10), chr(10) + '    ')}
     GROUP BY tw.name, t.storey_range
 ) AS per_range
-ORDER BY town, lowest_floor
+ORDER BY town, lowest_floor, storey_range
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: avg price step per storey range (nested)", q)
 
@@ -353,7 +353,7 @@ SELECT property_address, town, nearest_mrt,
 FROM v_singles_resale
 {where(conds)}
 GROUP BY block_id, property_address, town, nearest_mrt
-ORDER BY mrt_km, bus_km
+ORDER BY mrt_km, bus_km, property_address, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: singles (v_singles_resale view)", q)
 

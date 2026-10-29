@@ -1,33 +1,29 @@
-# gerome / Matthias integration validation
+# Integration and actual-data validation
 
-Validated locally on 29 October 2026 using Python 3.12.14, PostgreSQL 16.15 and MongoDB 8.0.17.
+Updated 29 October 2026. The integration preserves both gerome and Matthias histories.
 
-## Branch relationship
+## Executed validation
 
-`gerome` at `ccf5926` already includes `Matthias` at `6288f1b` through an existing merge commit. Integration starts from that combined history, retaining both contributors' commits. Original `main` was `d2d604b`.
+- 50 regression tests passed against isolated PostgreSQL 16 and MongoDB 8 servers.
+- Failure injection verifies paired-write compensation, failed reload rollback and PostgreSQL commit-failure recovery.
+- Concurrent creation of the same flat model succeeds with one shared identity.
+- Updates keep price-per-sqm and parsed lease values synchronized.
+- Malformed leases, invalid dates, unsupported updates and conflicting block attributes are rejected.
+- The actual provided 28-column CSV was loaded into both databases and every projected SQL value and MongoDB document compared with the cleaned source.
+- Full actual-data counts, source hash, all-ten-query comparison, spatial tests, actual-row edits and GUI checks are recorded in actual-data-validation.json.
+- CSV source: 171,924 rows, including one incomplete final row; 171,923 valid transactions in 9,709 blocks. Excluded CSV row 171925 is reported explicitly. No source edits were made.
+- Coordinates omitted by trimming are restored from the attributed September 2026 OneMap lookup only on exact address and postal agreement.
+- Median benchmark timings, raw samples and variability replace best-only timing. Different bulk-write rollback mechanisms remain disclosed.
 
-## Executed checks
+## Limitations and interpretation
 
-- 38 pytest checks passed against dedicated local PostgreSQL and MongoDB instances. No database tests were skipped.
-- Streamlit AppTest exercised all seven tabs, CSV build/load, Find a flat, profile creation, saved search/history insights and all ten Quick Search queries on Both engines.
-- Real-database tests covered query parity, distance boundaries, wildcard literals, half-value rounding, loading, CRUD, scoring, profile persistence across data reloads, benchmark counts and absence of benchmark mutations.
-- Python compilation and `git diff --check` passed.
-- Streamlit emitted upstream pandas deprecation warnings from its chart renderer; no application exceptions occurred.
+A reported failure can be compensated across PostgreSQL and standalone MongoDB;
+this is not a distributed crash-safe commit protocol. Use maintenance windows for
+reloads, keep backups, and reconcile after process/network interruption during
+recovery. Missing school/CBD source values remain missing. Coordinates represent
+the retrieved snapshot, not historical sale-time geography. Source consistency
+checks do not establish infallibility of upstream data or causation between
+amenities and resale prices. Upstream Streamlit/pandas chart deprecation warnings
+remain; the exercised GUI workflows have no application exceptions.
 
-## Corrections
-
-- Include 3Gen spelling variants in the model exclusion.
-- Filter raw distances before rounding their display values.
-- Align numeric rounding between PostgreSQL and MongoDB.
-- Exclude PostgreSQL connection setup from quick-query timing.
-- Treat substring wildcards literally on both engines.
-- Use the same geographic radius convention and distinct-block benchmark counts.
-- Use deterministic filter tie ordering and benchmark location/town selection.
-- Strip pandas string-extension columns before identity/boolean conversion.
-- Describe history/model filters and straight-line distance estimates without claiming current eligibility or actual walking routes.
-
-## Scope
-
-All test records are deliberately synthetic. The actual `HDB_Compass_trimmed_updated.csv` was not available and was not tested, as agreed with the requester. These checks establish the exercised behaviors, not an absence of every possible defect or production-volume performance. No existing application database or original HDB CSV was modified.
-
-GitHub Actions is configured to rerun the suite with disposable PostgreSQL 16 and MongoDB 8 services. Local results above do not imply that a hosted CI run has already completed.
+See README for normal startup, Docker/portable database setup and reproducible test commands.

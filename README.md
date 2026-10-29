@@ -96,7 +96,7 @@ Streamlit opens `http://localhost:8501`.
    document** side by side, with timings and an optional query plan.
 5. **Benchmark tab** — repeats a fixed set of operations (point lookup, indexed
    range scan, grouped aggregates, a 7-table join / no-join read, substring
-   search, geo radius, bulk update) N times and charts the best latency per
+   search, geo radius, bulk update) N times and charts the median latency per
    engine with a speed-up column. Both engines run the same 8 operations; the
    `how` column says how each engine executes them. The bulk update leaves the
    data unchanged (rolled back in PostgreSQL, a scratch field removed in
@@ -258,5 +258,54 @@ Both engines use the same Earth radius and count distinct blocks for the block-l
 substring/geographic benchmarks. Quick-search timings exclude PostgreSQL connection
 setup, and both engines round displayed aggregates with ties away from zero.
 
-Actual CSV loading and performance at production data volumes still need validation
-with your supplied CSV; the synthetic tests do not establish those results.
+The actual supplied CSV is validated separately by `scripts/validate_actual.py`; see `docs/actual-data-validation.json` for executed results.
+
+
+## 9. Actual data and integrity fixes
+
+The supplied trimmed file has 171,924 source rows. Its incomplete final record
+(CSV row 171925, including the header) is excluded with an explicit rejection
+report. The file itself is unchanged. Its price-per-sqm header mentions thousands,
+but the actual numeric values match SGD per sqm; do not multiply them by 1,000.
+Missing school/CBD values remain missing.
+
+`data/block_coordinates.json` supplies the source-attributed September 2026
+OneMap coordinates removed during trimming. Lookup requires exact block/street
+and postal-code agreement. Unmatched addresses receive no invented coordinates.
+These are snapshot coordinates, not proof of historic amenity conditions.
+
+Price/area updates recalculate price per sqm. Lease-text updates recalculate months.
+Unsupported fields, invalid lease strings and non-finite prices are rejected.
+Paired writes use a PostgreSQL transaction with MongoDB compensation on reported
+failure. This is not a crash-safe distributed transaction: interrupted processes
+or unavailable recovery services still require reconciliation.
+
+Reloads prevalidate both projections, stage MongoDB data and replace PostgreSQL
+inside one transaction. On a reported failure the old data is restored. Only the
+configured MongoDB transaction collection is replaced; unrelated collections and
+profiles survive. Keep the application in a maintenance window during reloads.
+
+For a fresh installation with Docker available:
+
+```powershell
+docker compose up -d
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Place the supplied HDB_Compass_trimmed_updated.csv in this folder.
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+These containers use local-development credentials and bind only to localhost.
+Do not use `docker compose down -v` unless you intend to delete their databases.
+The portable Windows setup remains supported. `run_app.ps1` uses this project's
+virtual environment and honors the database settings loaded from `.env`.
+
+Full actual-data validation (use dedicated test databases only):
+
+```powershell
+python scripts/validate_actual.py "C:\path\to\HDB_Compass_trimmed_updated.csv"
+```
+
+Set `TEST_PG_DSN` to the dedicated `hdb_test_actual` database and `TEST_MONGO_URI`
+to a test MongoDB server beforehand. The script reconciles all projected records,
+all ten query pairs, six distance metrics, actual-row updates and GUI queries.

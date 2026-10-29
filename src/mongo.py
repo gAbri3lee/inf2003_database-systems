@@ -20,8 +20,9 @@ import re
 from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
 from pymongo.errors import OperationFailure
 
-from .timing import stopwatch, Timing
+from .timing import stopwatch, Timing, benchmark_timing
 from .query_utils import EARTH_RADIUS_M
+from .mutations import updates
 
 VALIDATOR = {
     "$jsonSchema": {
@@ -29,6 +30,8 @@ VALIDATOR = {
         "required": ["_id", "month", "flat_type", "floor_area_sqm",
                      "resale_price", "block"],
         "properties": {
+            "month": {"bsonType": "date"},
+            "remaining_lease_months": {"bsonType": ["int","long","null"], "minimum":0,"maximum":1188},
             "flat_type": {"bsonType": "string"},
             "floor_area_sqm": {"bsonType": ["double", "int"],
                                "minimum": 0, "exclusiveMinimum": True},
@@ -87,7 +90,7 @@ class MongoRepo:
         with stopwatch("rebuild database (drop + collection + indexes)", "mongodb") as t:
             # A rebuild must not leave stale collections or metadata behind.
             # The database is recreated implicitly when the collection is made.
-            self.client.drop_database(self.db_name)
+            self.client[self.db_name].drop_collection(self.coll_name)
             db = self.client[self.db_name]
             if with_validator:
                 db.create_collection(
@@ -156,7 +159,15 @@ class MongoRepo:
 
     def update_transaction(self, txn_id: str, fields: dict):
         with stopwatch(f"update ({len(fields)} field/s)", "mongodb") as t:
-            res = self.coll.update_one({"_id": txn_id}, {"$set": fields})
+            current=self.coll.find_one({'_id':txn_id})
+            if current is None:
+                t.rows=0
+                return t
+            fields=updates(current,fields)
+            # Compare-and-set prevents overwriting a concurrent edit with stale derived values.
+            guard={key:current.get(key) for key in ['resale_price','floor_area_sqm','remaining_lease']}
+            res = self.coll.update_one({"_id": txn_id,**guard}, {"$set": fields})
+            if not res.matched_count: raise RuntimeError('Concurrent transaction edit; retry the update')
         t.rows = res.modified_count
         return t
 
@@ -233,9 +244,10 @@ class MongoRepo:
 
     # -------------------------------------------------- benchmark ------- #
     def benchmark(self, repeat: int = 5) -> list[Timing]:
+        if repeat<1: raise ValueError("Benchmark repetitions must be positive")
         results: list[Timing] = []
-        ids = self.sample_ids(20)
-        pid = ids[0] if ids else None
+        first=self.coll.find_one({}, {"_id":1},sort=[("_id",ASCENDING)])
+        pid=first["_id"] if first else None
         town_doc = self.coll.find_one({}, {"block.town": 1}, sort=[('block.town', ASCENDING)])
         some_town = town_doc["block"]["town"] if town_doc else None
         centre_doc = self.coll.find_one({"block.location": {"$ne": None}},
@@ -246,12 +258,13 @@ class MongoRepo:
         # engines by label. Engine-specific detail goes in extra["how"].
         def run(label, how, fn):
             best, rows = None, 0
+            samples=[]
             for _ in range(repeat):
                 with stopwatch(label, "mongodb") as t:
                     rows = fn()
+                samples.append(t.ms)
                 best = t.ms if best is None else min(best, t.ms)
-            results.append(Timing(label=label, engine="mongodb", ms=best,
-                                  rows=rows, extra={"how": how}))
+            results.append(benchmark_timing(label,"mongodb",samples,rows,how))
 
         if pid:
             run("point lookup by id", "_id index",

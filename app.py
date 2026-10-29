@@ -32,6 +32,7 @@ import streamlit as st
 import config
 from src import cleaning, quick, quick_mongo
 from src.loader import run_load
+from src.mutations import coordinated_write
 from src.mongo import MongoRepo
 from src.pg import SCORE_FACTORS, PgRepo
 from src.prefs import PrefsRepo
@@ -350,7 +351,7 @@ def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
                 axis=alt.Axis(labelLimit=320, labelFontSize=13, ticks=False, domain=False)),
         yOffset=alt.YOffset("engine:N", sort=["PostgreSQL", "MongoDB"]),
         x=alt.X("ms:Q", scale=alt.Scale(type="symlog"),
-                title="best time in ms (log-style scale)",
+                title="median time in ms (log-style scale)",
                 axis=alt.Axis(grid=True, values=[0, 1, 10, 100, 1000, 10000])),
         color=alt.Color("engine:N",
                         scale=alt.Scale(domain=list(ENGINE_COLORS),
@@ -411,21 +412,27 @@ with st.sidebar:
 
         if st.button("Build schema + load CSV", type="primary", icon=":material/rocket_launch:",
                      disabled=not (load_pg or load_mongo), width="stretch"):
-            with st.spinner("Loading… (first full run ≈ 1–2 min)"):
-                rep = run_load(
-                    csv_path, pg, mongo,
-                    limit=None if limit == 0 else int(limit),
-                    do_pg=load_pg, do_mongo=load_mongo, mongo_validator=validator,
+            try:
+                with st.spinner("Loading… (first full run ≈ 1–2 min)"):
+                    rep = run_load(
+                        csv_path, pg, mongo,
+                        limit=None if limit == 0 else int(limit),
+                        do_pg=load_pg, do_mongo=load_mongo, mongo_validator=validator,
+                    )
+                st.session_state.report = rep
+                record(*rep.timings)
+                pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
+                if rep.rejected_rows:
+                    st.warning(f"Excluded {len(rep.rejected_rows)} invalid CSV rows; source unchanged.")
+                    st.dataframe(pd.DataFrame(rep.rejected_rows))
+                st.success(
+                    f"Loaded {rep.rows_loaded:,} rows "
+                    f"(dropped {rep.dropped_invalid} invalid). "
+                    f"PG {rep.total_ms('postgres')/1000:.1f}s · "
+                    f"Mongo {rep.total_ms('mongodb')/1000:.1f}s"
                 )
-            st.session_state.report = rep
-            record(*rep.timings)
-            pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
-            st.success(
-                f"Loaded {rep.rows_loaded:,} rows "
-                f"(dropped {rep.dropped_invalid} invalid). "
-                f"PG {rep.total_ms('postgres')/1000:.1f}s · "
-                f"Mongo {rep.total_ms('mongodb')/1000:.1f}s"
-            )
+            except Exception as e:
+                st.error(f"Load failed; check the validation/recovery error: {type(e).__name__}: {e}")
 
     # Filled at the very end of the script (see bottom of file), after the tabs
     # have recorded this run's timings; otherwise the log lags one action behind.
@@ -789,17 +796,20 @@ with tab_crud:
         if cc1.button("Fill sample id"):
             st.session_state.last_id = _sample_id(); st.rerun()
         if st.button("Read", type="primary") and tid:
-            if "postgres" in engines:
-                rows, t = pg.get_transaction(tid); record(t); show_timing(t)
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), width="stretch")
-            if "mongodb" in engines:
-                doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
-                if doc:
-                    st.json(doc, expanded=False)
-            if target == "Both":
-                st.caption("SQL returns a flat row assembled from 8 tables; "
-                           "MongoDB returns the whole nested document in one hit.")
+            try:
+                if "postgres" in engines:
+                    rows, t = pg.get_transaction(tid); record(t); show_timing(t)
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), width="stretch")
+                if "mongodb" in engines:
+                    doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
+                    if doc:
+                        st.json(doc, expanded=False)
+                if target == "Both":
+                    st.caption("SQL returns a flat row assembled from 8 tables; "
+                               "MongoDB returns the whole nested document in one hit.")
+            except Exception as e:
+                st.error(f"Read failed: {type(e).__name__}: {e}")
 
     # ---- CREATE ------------------------------------------------------- #
     elif op == "Create":
@@ -840,19 +850,13 @@ with tab_crud:
                 lease_commence_year=None, remaining_lease=remaining_lease,
                 remaining_lease_months=cleaning._lease_to_months(remaining_lease),
             )
-            if "postgres" in engines:
-                try:
-                    t = pg.create_transaction(data); record(t); show_timing(t)
-                    _cached_summary.clear()              # banner's sale count changed
-                except Exception as e:
-                    st.error(f"PostgreSQL rejected the insert → {type(e).__name__}: {e}")
-            if "mongodb" in engines:
-                try:
-                    doc = _mongo_doc_from_input(mongo, data)
-                    t = mongo.create_transaction(doc); record(t); show_timing(t)
-                except Exception as e:
-                    st.error(f"MongoDB rejected the insert → {type(e).__name__}: {e}")
-            st.session_state.last_id = new_id
+            try:
+                doc=_mongo_doc_from_input(mongo,data) if 'mongodb' in engines else None
+                for t in coordinated_write(pg,mongo,engines,'create',new_id,data,doc): record(t);show_timing(t)
+                _cached_summary.clear()
+                st.session_state.last_id=new_id
+            except Exception as e:
+                st.error(f'Create failed: {type(e).__name__}: {e}')
 
     # ---- UPDATE ----------------------------------------------------- #
     elif op == "Update":
@@ -868,26 +872,22 @@ with tab_crud:
             except ValueError:
                 st.error(f"'{raw}' isn't a number.")
                 engines = []                 # skip both updates below
-            if "postgres" in engines:
+            if engines:
                 try:
-                    t = pg.update_transaction(tid, {field: val}); record(t); show_timing(t)
+                    for t in coordinated_write(pg,mongo,engines,'update',tid,{field:val}): record(t);show_timing(t)
+                    _cached_summary.clear()
                 except Exception as e:
-                    st.error(f"PostgreSQL rejected the update → {type(e).__name__}: {e}")
-            if "mongodb" in engines:
-                try:
-                    t = mongo.update_transaction(tid, {field: val}); record(t); show_timing(t)
-                except Exception as e:
-                    st.error(f"MongoDB rejected the update → {type(e).__name__}: {e}")
+                    st.error(f'Update failed: {type(e).__name__}: {e}')
 
     # ---- DELETE --------------------------------------------------- #
     elif op == "Delete":
         tid = st.text_input("transaction_id", value=st.session_state.get("last_id", ""))
         if st.button("Delete", type="primary") and tid:
-            if "postgres" in engines:
-                t = pg.delete_transaction(tid); record(t); show_timing(t)
-                _cached_summary.clear()                  # banner's sale count changed
-            if "mongodb" in engines:
-                t = mongo.delete_transaction(tid); record(t); show_timing(t)
+            try:
+                for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
+                _cached_summary.clear()
+            except Exception as e:
+                st.error(f'Delete failed: {type(e).__name__}: {e}')
 
 # ------------------------------------------------------------------- Filter -- #
 with tab_filter:
@@ -1171,7 +1171,7 @@ with tab_quick:
 # ---------------------------------------------------------------- Benchmark -- #
 with tab_bench:
     st.subheader("Repeat a fixed set of operations and compare")
-    repeat = st.slider("Repetitions per operation (best time kept)", 1, 25, 5)
+    repeat = st.slider("Measured repetitions per operation (median shown)", 1, 25, 5)
     if st.button("Run benchmark", type="primary"):
         results: list[Timing] = []
         with st.spinner("Benchmarking PostgreSQL…"):
@@ -1185,6 +1185,8 @@ with tab_bench:
             except Exception as e:
                 st.error(f"MongoDB benchmark failed: {e}")
         record(*results)
+        with st.expander("All benchmark samples and variability"):
+            st.json([{ "engine":t.engine,"operation":t.label,**t.extra} for t in results])
         bf = pd.DataFrame([(t.label, t.engine, round(t.ms, 3), t.rows,
                             t.extra.get("how", "")) for t in results],
                           columns=["operation", "engine", "ms", "rows", "how"])
@@ -1193,7 +1195,7 @@ with tab_bench:
     if "bench" in st.session_state:
         bf = st.session_state.bench
         piv = bf.pivot_table(index="operation", columns="engine", values="ms")
-        st.markdown("**Best latency per operation: shorter bar = faster**")
+        st.markdown("**Median latency per operation: shorter bar = faster**")
         st.altair_chart(_bench_chart(bf), width="stretch")
         if {"postgres", "mongodb"}.issubset(piv.columns):
             # only name a winner when both engines actually ran the operation
@@ -1204,9 +1206,7 @@ with tab_bench:
             piv["speedup ×"] = (piv[["postgres", "mongodb"]].max(axis=1) /
                                 piv[["postgres", "mongodb"]].min(axis=1)).round(1).where(paired)
         st.dataframe(piv, width="stretch")
-        st.caption("`rows` differ on purpose for substring/geo search: PostgreSQL "
-                   "searches the ~10k blocks, MongoDB the ~172k transactions that "
-                   "each embed a copy of their block.")
+        st.caption("Substring and geographic benchmarks return distinct block counts on both engines.")
         st.dataframe(bf, width="stretch", hide_index=True)
 
 # -------------------------------------------------------------------- Notes -- #
@@ -1239,14 +1239,13 @@ with tab_notes:
   (`ForeignKeyViolation`, `CheckViolation`).
 * **Normalization removes redundancy & update anomalies.** A town or flat-model
   name is stored once. `blocks` holds ~10k rows; MongoDB repeats the block
-  sub-document in all ~172k transactions (`collstats` logical size ≈ 260 MB vs
-  the whole PostgreSQL database ≈ 147 MB). Smaller tables also make the geo and
-  substring scans *faster* here, not slower.
+  sub-document in all ~172k transactions (inspect storage statistics for the loaded dataset). Latency depends on
+  indexes, data size and execution plans.
 * **Mature planner + `EXPLAIN`.** Turn on "Show query plan" in the Filter tab.
-  Hash aggregates over the narrow `transactions` table beat scanning fat
-  documents for the group-by-town / monthly-trend queries.
+  Inspect aggregates over `transactions` and MongoDB documents to explain
+  observed group-by-town / monthly-trend timings.
 * **Transactions.** The benchmark's bulk update runs in a transaction and is
-  rolled back — the DB is byte-for-byte unchanged. A standalone MongoDB has no
+  rolled back — the committed logical values are unchanged; physical files and WAL can change. A standalone MongoDB has no
   multi-document rollback.
 * **Ad-hoc joins.** `v_transactions_full` joins 8 tables with no schema change.
 
@@ -1279,10 +1278,9 @@ with tab_notes:
    MongoDB (validator off) would accept the orphan.
 3. **Filter → Both** with the geo radius on — read the generated SQL vs the
    Mongo query document.
-4. **Benchmark** — point lookup & the pre-indexed top-20 favour MongoDB;
-   grouped aggregates, substring search and the transactional bulk update favour
-   PostgreSQL. The lesson is *"it depends on the access pattern"*, which is the
-   point of the comparison.
+4. **Benchmark** — measure each workload and inspect query plans. Explain observed
+   results rather than assuming a winning engine. Bulk updates use different
+   rollback strategies and are not identical write workloads.
         """
     )
 
