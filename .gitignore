@@ -26,3 +26,5 @@ mongodata/
 .DS_Store
 Thumbs.db
 CLAUDE.md
+# Database backups (Admin tab)
+backups/

@@ -11,6 +11,7 @@ import pandas as pd
 from . import cleaning
 from .mongo import MongoRepo
 from .pg import PgRepo
+from .quick import SINGLES_VIEW_SQL
 from .timing import Timing, stopwatch
 
 
@@ -65,6 +66,8 @@ def run_load(
         pg.ensure_database()
         report.timings.append(pg.build_schema())
         report.timings.extend(pg.load(tables))
+        with pg.conn(autocommit=True) as c:   # owner-only; GUI logins just read it
+            c.execute(SINGLES_VIEW_SQL)
         report.table_counts = pg.counts()
 
     if do_mongo:

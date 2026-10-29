@@ -67,8 +67,10 @@ SORT_FIELD = {
 
 
 class MongoRepo:
-    def __init__(self, uri: str, db_name: str, coll_name: str = "transactions"):
-        self.client = MongoClient(uri, serverSelectionTimeoutMS=4000)
+    def __init__(self, uri: str, db_name: str, coll_name: str = "transactions",
+                 **client_kwargs):
+        # client_kwargs: username/password/authSource for a least-privilege login
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=4000, **client_kwargs)
         self.db_name = db_name
         self.coll_name = coll_name
 

@@ -71,22 +71,45 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   repo(s) are selected — when adding a capability, implement it symmetrically
   on both repos so the GUI's "Both" mode keeps working.
 * [src/loader.py](src/loader.py) (`run_load`) is the only orchestrator that
-  calls both `cleaning` and both repos together; it drives the sidebar's
+  calls both `cleaning` and both repos together; it drives the Admin tab's
   "Build schema + load CSV" button and returns a `LoadReport` used by the
   Overview tab.
 * [src/timing.py](src/timing.py)'s `stopwatch()` context manager wraps *every*
   DB call in both repos and is the sole source of the millisecond numbers
   shown in the GUI and appended to the sidebar operation log — any new DB
   operation should be wrapped in `stopwatch(label, engine)` to stay consistent.
-* [app.py](app.py) is a single-file Streamlit app with 6 tabs (Find a flat,
-  Overview, CRUD, Filter, Benchmark, Notes) plus a sidebar (connection health,
-  build/load controls, operation log). `PgRepo`/`MongoRepo`/`PrefsRepo`
-  instances are memoized via `@st.cache_resource`; distinct-value lookups for
-  filter dropdowns are memoized via `@st.cache_data` and explicitly cleared
-  after a reload. Find-a-flat widgets all use `ff_*` keys and are never given
+* [app.py](app.py) only assembles the page: role switch, sidebar, and a `TABS`
+  registry of `(label, capability, module)`. Each tab is a module in
+  [ui/](ui/) exposing `render(ctx)` (find_flat, overview, crud, filter_tab,
+  quick_search, benchmark, notes, admin); `src/` never imports Streamlit.
+  A new page = new `ui/` module + one registry line.
+* **Roles / least privilege**: the top-right "Viewing as" switch
+  ([ui/roles.py](ui/roles.py)) picks a `Role` from
+  [src/security.py](src/security.py) (guest, member, editor, admin; each has
+  `caps` that gate tabs/features). [ui/resources.py](ui/resources.py) builds
+  per-role repos (memoized per role key) on that role's *own* DB logins:
+  PG `hdb_reader` (SELECT) / `hdb_editor` (+ DML on `transactions`, INSERT on
+  `flat_models`) / owner for admin; Mongo users `hdb_guest`/`hdb_member`/
+  `hdb_editor`/`hdb_admin`. `resources.provision()` creates them once per
+  server start with the owner accounts. Consequences: anything that does DDL,
+  `collMod`, `createIndex` or `drop` must run as admin (load, restore,
+  `PrefsRepo.ensure_schema`, `v_singles_resale` creation); table grants are
+  lost on DROP, so `pg.GRANTS_SQL` is re-run by `build_schema` and restore.
+  Shared read caches (`pg_distinct`, `site_stats`) use the guest repos.
+  MongoDB only enforces its users when `mongod` runs with `--auth`.
+* **Backups** ([src/backup.py](src/backup.py), Admin tab): per-table
+  `COPY ... csv.gz` + raw BSON per collection + SHA-256 manifest under
+  `config.BACKUP_DIR`. PG restore is one transaction (SCHEMA_SQL + COPYs);
+  Mongo restores into `<coll>__restore` then `renameCollection(dropTarget)`.
+  If the PG schema gains a column, old backups fail `HEADER MATCH` and roll
+  back cleanly — that's intended.
+* `PgRepo`/`MongoRepo`/`PrefsRepo` instances are memoized via
+  `@st.cache_resource`; distinct-value lookups for filter dropdowns are
+  memoized via `@st.cache_data` and cleared (`clear_data_caches`) after a
+  reload/restore. Find-a-flat widgets all use `ff_*` keys and are never given
   `value=`; to change them programmatically (loading a profile/saved search),
-  set `st.session_state.ff_pending` and `st.rerun()` — `_ff_apply` writes the
-  keys at the top of the next run, before the widgets exist.
+  set `st.session_state.ff_pending` and `st.rerun()` — `find_flat._apply`
+  writes the keys at the top of the next run, before the widgets exist.
 * Look and feel: widget colours, fonts and the dark sidebar come from
   [.streamlit/config.toml](.streamlit/config.toml) (only read at server
   start — restart Streamlit after editing it). [assets/style.css](assets/style.css)

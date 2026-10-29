@@ -304,8 +304,9 @@ ORDER BY town, lowest_floor
     return _run(repo, "quick: avg price step per storey range (nested)", q)
 
 
-# 10. singles: "EXCLUDE 3Gen flat_model using VIEW".  Created on demand
-# (CREATE OR REPLACE) so it survives a schema rebuild without editing pg.py.
+# 10. singles: "EXCLUDE 3Gen flat_model using VIEW".  Kept out of pg.py's
+# SCHEMA_SQL: the loader, a backup restore and security.provision_pg create it
+# with the owner account, because the read-only GUI logins can't CREATE.
 SINGLES_VIEW_SQL = f"""
 CREATE OR REPLACE VIEW v_singles_resale AS
 SELECT t.transaction_id, t.month, tw.name AS town, b.block_id,
@@ -327,7 +328,9 @@ WHERE  COALESCE(fm.name, '') !~* '{MULTIGEN}'
 def singles(repo, p, limit=200):
     """10. Singles: MRT and bus distance, reading the v_singles_resale view."""
     with repo.conn(autocommit=True) as c:
-        c.execute(SINGLES_VIEW_SQL)
+        # normally already there; creating it here only works for the owner
+        if c.execute("SELECT to_regclass('v_singles_resale') AS v").fetchone()["v"] is None:
+            c.execute(SINGLES_VIEW_SQL)
     conds = ["mrt_km IS NOT NULL"]
     if p.get("towns"):
         conds.append(f"town IN ({lits(p['towns'])})")

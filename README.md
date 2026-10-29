@@ -66,11 +66,27 @@ Streamlit opens `http://localhost:8501`.
 
 ## 4. Using the GUI
 
-1. **Sidebar → ② Build & load** — point at the CSV (defaults to
+0. **Viewing as (top right)** — there is no login screen; pick a role. Each
+   role sees only its tabs *and* connects with its own least-privilege
+   database logins (see [Security](#security-least-privilege)):
+
+   | Role | Sees | PostgreSQL login | MongoDB user |
+   |---|---|---|---|
+   | Guest | Find a flat (no saving), Overview, Filter, Quick search, Notes | `hdb_reader` (SELECT) | `hdb_guest` (read `hdb`) |
+   | Member | + profiles, saved searches, history | `hdb_reader` | `hdb_member` (+ write `hdb_users`) |
+   | Editor | + CRUD, Benchmark | `hdb_editor` (+ INSERT/UPDATE/DELETE on `transactions`) | `hdb_editor` (+ write `hdb.transactions`) |
+   | Admin | + Admin tab | owner (`PGUSER`) | `hdb_admin` (dbOwner) |
+
+   **Access** (next to the switch) shows what the current role may do, read
+   back from the databases, and *Try deleting a sale as this role* shows a
+   guest being refused by PostgreSQL itself.
+1. **Admin tab → Load data** — point at the CSV (defaults to
    `HDB_Compass_trimmed_updated.csv` in the project folder; override with the
    `HDB_CSV` environment variable), optionally cap the row count for a quick
-   run, then **Build schema + load CSV**. Per-stage timings appear on the
-   **Overview** tab.
+   run, then **Build schema + load CSV** (it backs the current data up first
+   by default). Per-stage timings appear on the **Overview** tab.
+   **Admin tab → Backups** takes, verifies, restores and deletes backups
+   (see [Backups](#backups)).
 2. **Find a flat tab** — the buyer-facing part of the app.
    * Pick towns, flat types, budget, minimum size / lease, and how far back to
      compare sales, then set a 0–100 weight for each priority (affordability,
@@ -100,6 +116,9 @@ Streamlit opens `http://localhost:8501`.
    MongoDB).
 6. **Notes tab** — a written summary of the strengths and weaknesses the
    prototype demonstrates.
+
+7. **Admin tab** — Load data, Backups, and a *who can do what* matrix for all
+   four roles.
 
 ## 5. Data model
 
@@ -186,12 +205,71 @@ Each collection has a `$jsonSchema` validator (weights must be integers 0–100)
   "searched_at": ISODate }
 ```
 
-## 6. Project layout
+## 6. Security, reliability and scalability
+
+### Security: least privilege
+
+Every GUI role connects with its own logins, holding only what its screens
+need, so a guest session can't change data even if the GUI had a bug.
+`src/security.py` creates them automatically the first time the app starts
+(using the `PGUSER` / `MONGO_URI` accounts), and re-checks them on every
+server start:
+
+* **PostgreSQL:** `hdb_reader` can only `SELECT`; `hdb_editor` is
+  `hdb_reader` plus `INSERT/UPDATE/DELETE` on `transactions` (and `INSERT` on
+  `flat_models`). `CONNECT` on the database is revoked from `PUBLIC`, nobody
+  but the owner can `CREATE`, and default privileges make tables from future
+  rebuilds readable. Table grants are re-applied after every rebuild/restore.
+* **MongoDB:** custom roles `hdbGuest` (read `hdb`), `hdbMember` (+ find/insert/
+  update/remove in `hdb_users`, but no drop) and `hdbEditor` (+ the same on
+  `hdb.transactions`); `hdb_admin` is `dbOwner` of both databases. Validators
+  and indexes are created by provisioning, so no runtime role needs `collMod`.
+
+PostgreSQL always enforces this. **MongoDB only enforces it when `mongod` runs
+with authorization on**; until then the Access panel says so. To turn it on,
+start the app once (so the users exist), then restart MongoDB with `--auth`
+(or `security: authorization: enabled` in `mongod.cfg` for the Windows
+service). Passwords default to the login names: set `PG_READER_PASSWORD`,
+`PG_EDITOR_PASSWORD`, `MONGO_GUEST_PASSWORD`, `MONGO_MEMBER_PASSWORD`,
+`MONGO_EDITOR_PASSWORD` and `MONGO_ADMIN_PASSWORD` in `.env` for anything real.
+
+### Backups
+
+*Admin → Backups* writes a folder per backup under `backups/` (override with
+`HDB_BACKUP_DIR`; the newest `HDB_BACKUP_KEEP`, default 10, are kept):
+
+```
+backups/2026-10-29_091815/
+├─ manifest.json                       row/doc counts + SHA-256 per file
+├─ postgres/<table>.csv.gz             COPY ... TO STDOUT
+└─ mongodb/<db>/<collection>.bson.gz   raw BSON (what mongodump writes)
+```
+
+* The PostgreSQL tables are dumped in one `REPEATABLE READ` read-only
+  transaction, so they form a consistent snapshot.
+* Both MongoDB databases are included; `hdb_users` matters most, because
+  resale data can be rebuilt from the CSV but profiles can't.
+* A backup is written to `<name>.partial` and renamed only when complete.
+* **Restore** first verifies every checksum. PostgreSQL then rebuilds and
+  reloads everything inside one transaction, so a failure rolls back to the
+  current data. MongoDB restores each collection into a staging collection,
+  checks the count, and swaps it in with one atomic `renameCollection`.
+* *Build schema + load CSV* takes a backup first by default.
+
+### Scalability: modular code
+
+The database layer (`src/`) knows nothing about Streamlit; the pages (`ui/`)
+are one module per tab, each with `render(ctx)`, and `app.py` is a short
+registry of tabs and the capability each needs. A new page or role is a new
+module and a registry line, and team members can work on different tabs
+without editing the same file.
+
+## 7. Project layout
 
 ```
 Project/
-├─ app.py                 Streamlit GUI (all 6 tabs)
-├─ config.py              connection strings + paths (edit here)
+├─ app.py                 assembles the page: role switch, sidebar, tab registry
+├─ config.py              connection strings, role passwords, backup dir (edit here)
 ├─ requirements.txt
 ├─ run_app.ps1            start PG (if needed) + launch Streamlit
 ├─ .streamlit/config.toml theme: colours, fonts, sidebar, chart palette
@@ -199,23 +277,39 @@ Project/
 ├─ scripts/
 │  ├─ pg_setup.ps1        one-time initdb + createdb
 │  ├─ pg_start.ps1 / pg_stop.ps1
-├─ src/
+├─ src/                   database layer (no Streamlit)
 │  ├─ cleaning.py         CSV -> typed frame -> normalized tables / documents
-│  ├─ pg.py               PgRepo: schema, COPY load, CRUD, filter, benchmark
+│  ├─ pg.py               PgRepo: schema + grants, COPY load, CRUD, filter, benchmark
 │  ├─ mongo.py            MongoRepo: schema+indexes, load, CRUD, filter, benchmark
 │  ├─ prefs.py            PrefsRepo: user profiles, saved searches, history
+│  ├─ quick.py / quick_mongo.py   canned "Quick search" queries per engine
+│  ├─ security.py         roles, login provisioning, privilege checks
+│  ├─ backup.py           create / verify / restore / prune backups
 │  ├─ loader.py           run_load(): orchestrates both, collects timings
 │  └─ timing.py           stopwatch helpers
+├─ ui/                    presentation layer, one module per tab
+│  ├─ resources.py        per-role connections, provisioning, cached lookups
+│  ├─ roles.py            "Viewing as" switch + Access panel
+│  ├─ layout.py           sidebar, hero banner, operation log
+│  ├─ common.py           colours, timing badge, shared helpers
+│  └─ find_flat.py, overview.py, crud.py, filter_tab.py,
+│     quick_search.py, benchmark.py, notes.py, admin.py
+├─ backups/               created by the Admin tab (gitignored)
 └─ vendor/pgsql/          portable PostgreSQL 16 binaries
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
+
+* **"Couldn't set up the least-privilege logins"** in the sidebar → the
+  `PGUSER` account needs `CREATEROLE` (the `initdb` user has it), and MongoDB
+  must either run without `--auth` the first time or have `MONGO_URI` carry a
+  user that may create users. The Admin role keeps working either way.
 
 * **`PostgreSQL down`** in the sidebar → run `scripts\pg_start.ps1`. Check
   `pgdata\server.log`.
 * **Port 5433 busy** → edit `port` in `scripts\pg_setup.ps1` and `PGPORT` /
   `config.py`, re-run setup.
 * **`MongoDB down`** → `Get-Service MongoDB` and `Start-Service MongoDB`.
-* **Reload from scratch** → just click *Build schema + load CSV* again; both
-  sides are dropped and recreated.
-* **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.
+* **Reload from scratch** → as Admin, click *Build schema + load CSV* again;
+  both sides are dropped and recreated (after a backup, unless you untick it).
+* **CSV elsewhere** → set the path in the Admin tab, or `setx HDB_CSV "C:\path\to.csv"`.

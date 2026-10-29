@@ -176,6 +176,27 @@ JOIN   towns  tw ON tw.town_id = b.town_id
 GROUP  BY tw.name, t.month;
 """
 
+# Least-privilege logins (created by src/security.py). Table-level grants are
+# lost when SCHEMA_SQL drops the tables, so build_schema (and a backup restore)
+# re-applies them. Skipped quietly if the roles or tables don't exist yet.
+READER_ROLE = "hdb_reader"
+EDITOR_ROLE = "hdb_editor"
+GRANTS_SQL = r"""
+DO $$
+BEGIN
+    IF to_regclass('public.transactions') IS NULL THEN
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'hdb_reader') THEN
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO hdb_reader;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'hdb_editor') THEN
+        GRANT INSERT, UPDATE, DELETE ON transactions TO hdb_editor;
+        GRANT INSERT ON flat_models TO hdb_editor;  -- create_transaction may add a model
+    END IF;
+END $$;
+"""
+
 # tables in a valid insertion order (parents first)
 LOAD_ORDER = [
     "towns", "flat_models", "mrt_lines", "mrt_stations", "station_lines",
@@ -260,6 +281,7 @@ class PgRepo:
     def build_schema(self) -> Timing:
         with stopwatch("build schema", "postgres") as t, self.conn() as c:
             c.execute(SCHEMA_SQL)
+            c.execute(GRANTS_SQL)
             c.commit()
         return t
 
