@@ -5,7 +5,7 @@ Same signature and same output columns as the PostgreSQL versions::
     rows, timing, pipeline_text = QUERIES[qid](mongo_repo, params, limit)
 
 There are no views or nested SQL here: aggregates are ``$group`` stages, the
-"nested" floor-premium step is computed after the ``$group`` in Python, and the
+"nested" floor-premium step is a ``$setWindowFields`` stage, and the
 singles "view" is just a ``$match`` that excludes Multi-Generation flats.
 """
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
-from decimal import Decimal, ROUND_HALF_UP
 
 from .mongo import MongoRepo, _as_dt
 from .quick import MULTIGEN, METRICS, months_ago, plain_row, window_params
@@ -237,28 +236,37 @@ def flat_age(repo, p, limit=200):
 
 
 def floor_premium(repo, p, limit=None):
+    """9. Average price per storey range and the step up from the range below.
+
+    Runs entirely inside MongoDB: ``$setWindowFields`` with ``$shift`` is the
+    pipeline twin of SQL's ``LAG() OVER (PARTITION BY town ORDER BY lowest_floor)``.
+    ``$round`` here is rewritten by :func:`_run` to PostgreSQL's rounding."""
     m = _match(p)
     m["storey_range"] = {**m.get("storey_range", {}), "$ne": None}
-
-    def post(rows):
-        rows.sort(key=lambda r: (r["town"], int(r["storey_range"].split()[0]),r["storey_range"]))
-        prev_town, prev = None, None
-        for r in rows:
-            r["increase_vs_prev_range"] = (
-                float((Decimal(str(r["avg_price"])) - Decimal(str(prev))).quantize(
-                    Decimal('1'), rounding=ROUND_HALF_UP)) if r["town"] == prev_town else None)
-            prev_town, prev = r["town"], r["avg_price"]
-            r["avg_price"] = float(Decimal(str(r["avg_price"])).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
-        return rows[:int(limit)] if limit else rows
-
+    order = {"lowest_floor": 1, "storey_range": 1}
     pipe = [
         {"$match": m},
         {"$group": {"_id": {"t": "$block.town", "s": "$storey_range"},
                     "n": {"$sum": 1}, "avg": {"$avg": "$resale_price"}}},
         {"$project": {"_id": 0, "town": "$_id.t", "storey_range": "$_id.s",
-                      "transactions": "$n", "avg_price": "$avg"}},
+                      "transactions": "$n", "avg": "$avg",
+                      # "10 TO 12" -> 10, as SPLIT_PART(...) does in SQL
+                      "lowest_floor": {"$toInt": {"$arrayElemAt": [
+                          {"$split": ["$_id.s", " "]}, 0]}}}},
+        {"$setWindowFields": {
+            "partitionBy": "$town", "sortBy": order,
+            "output": {"prev_avg": {"$shift": {"output": "$avg", "by": -1}}}}},
+        {"$project": {
+            "town": 1, "storey_range": 1, "transactions": 1, "lowest_floor": 1,
+            "avg_price": {"$round": ["$avg", 0]},
+            "increase_vs_prev_range": {"$cond": [
+                {"$eq": [{"$ifNull": ["$prev_avg", None]}, None]}, None,
+                {"$round": [{"$subtract": ["$avg", "$prev_avg"]}, 0]}]}}},
+        {"$sort": {"town": 1, **order}},
+        *_limit(limit),
+        {"$project": {"lowest_floor": 0}},
     ]
-    return _run(repo, "quick: avg price step per storey range", pipe, post)
+    return _run(repo, "quick: avg price step per storey range", pipe)
 
 
 def singles(repo, p, limit=200):

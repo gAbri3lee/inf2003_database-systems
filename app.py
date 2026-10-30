@@ -31,14 +31,14 @@ import streamlit as st
 from bson.json_util import dumps as bson_dumps
 
 import config
-from src import cleaning, quick, quick_mongo
+from src import cleaning, experiments, quick, quick_mongo, report
 from src.distance import WALK_M_PER_MIN, distance_label, walking_minutes
 from src.loader import run_load
 from src.mutations import coordinated_write
 from src.mongo import MongoRepo
 from src.pg import SCORE_FACTORS, PgRepo
-from src.prefs import PrefsRepo
-from src.timing import Timing
+from src.prefs import NOTE_MAX, SHORTLIST_CAP, PrefsRepo, attach_current
+from src.timing import Timing, stopwatch
 from src.transaction_display import mongo_transaction_row
 
 APP_NAME = "HomeWise SG"
@@ -381,6 +381,43 @@ def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
     return (bars + labels).properties(height=46 * data["operation"].nunique() + 20)
 
 
+def _ix_chart(df: pd.DataFrame) -> alt.Chart:
+    """Median latency per mode: one panel per query (rows) and copy size (columns).
+    symlog like _bench_chart, so a 0.5 ms and an 80 ms bar both stay readable."""
+    data = df.assign(
+        mode_label=df["mode"].map({"no index": "no index", "index": "index",
+                                   "index rebuilt": "rebuilt"}),
+        size_label=df["size"].map(lambda n: f"{n:,} sales"))
+    base = alt.Chart(data).encode(
+        x=alt.X("mode_label:N", sort=["no index", "index", "rebuilt"], title=None,
+                axis=alt.Axis(labelAngle=0, labelOverlap=False, labelFontSize=11,
+                              ticks=False, domain=False)),
+        xOffset=alt.XOffset("engine:N", sort=["PostgreSQL", "MongoDB"]),
+        y=alt.Y("median_ms:Q", scale=alt.Scale(type="symlog"), title=None,
+                axis=alt.Axis(values=[0, 1, 10, 100], grid=True, labelFontSize=11)),
+        color=alt.Color("engine:N",
+                        scale=alt.Scale(domain=list(ENGINE_COLORS),
+                                        range=list(ENGINE_COLORS.values())),
+                        legend=alt.Legend(orient="top", title=None, labelFontSize=13)),
+        tooltip=["engine", "query", "mode", alt.Tooltip("median_ms:Q", format=",.2f"),
+                 alt.Tooltip("p95_ms:Q", format=",.2f"), "plan", "examined"],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=3)
+    labels = base.mark_text(dy=-6, fontSize=10, color=LABEL_GREY).encode(
+        text=alt.Text("median_ms:Q", format=",.1f"))
+    return (alt.layer(bars, labels, data=data)
+            .properties(width=230, height=110)
+            .facet(row=alt.Row("query:N", title=None,
+                               header=alt.Header(labelAngle=0, labelAlign="left",
+                                                 labelLimit=300, labelFontSize=13)),
+                   column=alt.Column("size_label:N", title=None,
+                                     sort=sorted(data["size_label"].unique(),
+                                                 key=lambda t: int(t.split()[0].replace(",", ""))),
+                                     header=alt.Header(labelFontSize=13)),
+                   title=alt.TitleParams("median ms per run (log-style scale; bar labels in ms)",
+                                         anchor="start", fontSize=12, color=LABEL_GREY)))
+
+
 def _local_time(t: dt.datetime) -> str:
     """MongoDB hands back naive UTC datetimes; show them in local time."""
     return t.replace(tzinfo=dt.timezone.utc).astimezone().strftime("%d %b %H:%M")
@@ -556,6 +593,14 @@ with tab_find:
             ss.ff_pending = {"weights": doc.get("weights"), "filters": doc.get("filters")}
             st.rerun()
 
+    # ---- shortlist (MongoDB): which flats this profile already saved ---- #
+    shortlist, saved_ids = [], set()
+    if user:
+        shortlist, _ = prefs.get_shortlist(user)
+        saved_ids = {e["transaction_id"] for e in shortlist}
+    if "ff_flash" in ss:
+        st.toast(ss.pop("ff_flash"))
+
     # ---- filters + priorities ------------------------------------------ #
     left_panel, right_panel = st.columns([5, 6])
     with left_panel.container(border=True, height="stretch"):
@@ -685,6 +730,43 @@ with tab_find:
                 ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
                 if ignored:
                     st.caption("Not counted (weight 0): " + ", ".join(ignored))
+                tid = str(r["transaction_id"])
+                # one-page PDF of this flat, built only when the button is clicked
+                pdf_flat = r.to_dict()
+                pdf_parts = [dict(label=FACTORS[k][0], weight=weights[k],
+                                  points=float(r[f"s_{k}"]) * weights[k] / sum(weights.values()),
+                                  text=_ff_explain(k, r).split("**: ", 1)[-1])
+                             for k in active]
+                pdf_note = next((e.get("note", "") for e in shortlist
+                                 if e["transaction_id"] == tid), "")
+                st.download_button(
+                    "Save as PDF", key="ff_pdf", icon=":material/picture_as_pdf:",
+                    data=lambda: report.make_flat_pdf(pdf_flat, pdf_parts, pdf_note),
+                    file_name=report.suggested_filename(pdf_flat), mime="application/pdf",
+                    width="stretch",
+                    help="A printable summary of this flat: details, map, nearby amenities "
+                         "and why it scored the way it did.")
+                if user is None:
+                    st.caption("Pick or create a profile to keep a shortlist of flats.")
+                elif tid in saved_ids:
+                    sb1, sb2 = st.columns(2)
+                    sb1.button("Saved to shortlist", key="ff_shortlist_saved", disabled=True,
+                               icon=":material/bookmark_added:", width="stretch")
+                    if sb2.button("Remove", key="ff_shortlist_rm_sel",
+                                  icon=":material/bookmark_remove:", width="stretch"):
+                        record(prefs.remove_from_shortlist(user, tid))
+                        ss.ff_flash = "Removed from your shortlist"
+                        st.rerun()
+                elif st.button("Add to shortlist", key="ff_shortlist_add",
+                               icon=":material/bookmark_add:", width="stretch"):
+                    status, t = prefs.add_to_shortlist(user, r, r["score"], weights)
+                    record(t)
+                    ss.ff_flash = {
+                        "added": "Added to your shortlist",
+                        "already_saved": "Already on your shortlist",
+                        "full": f"Your shortlist is full ({SHORTLIST_CAP} flats): remove one first",
+                    }[status]
+                    st.rerun()
             with where.container(border=True, height="stretch"):
                 st.markdown("#### :material/map: Where they are")
                 st.pydeck_chart(_ff_map(df, idx), height=520)
@@ -695,6 +777,79 @@ with tab_find:
 
     # ---- saved searches + history (MongoDB) ---------------------------- #
     if user:
+        st.markdown(f"### :material/bookmark: {user}'s shortlist")
+        st.caption(f"Flats you saved, up to {SHORTLIST_CAP}. Stored in MongoDB with a snapshot "
+                   "of the sale, and looked up again in PostgreSQL by transaction id.")
+        if not shortlist:
+            st.info("Nothing saved yet: select a result and click **Add to shortlist**.")
+        else:
+            try:
+                current_rows, _ = pg.get_flats_by_ids([e["transaction_id"] for e in shortlist])
+            except Exception as exc:
+                current_rows = None          # lookup failed: don't claim sales are gone
+                st.warning(f"Could not look up the current sales in PostgreSQL: {exc}")
+            now_res = ss.get("ff_result")
+            now_scores = (dict(zip(now_res["df"]["transaction_id"], now_res["df"]["score"]))
+                          if now_res and not now_res["df"].empty else {})
+            for e in attach_current(shortlist, current_rows or []):
+                tid, snap, cur = e["transaction_id"], e["snapshot"], e["current"]
+                with st.container(border=True):
+                    top_l, top_r = st.columns([4, 2], vertical_alignment="top")
+                    top_l.markdown(
+                        f"**Blk {snap['block_no']} {snap['street_name'].title()}**  \n"
+                        f"{snap['town'].title()} · {snap['flat_type']} · storey "
+                        f"{snap['storey_range']} · {snap['floor_area_sqm']:.0f} sqm")
+                    top_r.markdown(f"**${snap['resale_price']:,.0f}**  \n"
+                                   f":gray[sold {snap['sold_month']:%b %Y}]")
+                    facts = [f"score when saved **{e['score_when_saved']:.0f} / 100**"]
+                    if tid in now_scores:
+                        facts.append(f"now **{now_scores[tid]:.0f} / 100** in these results")
+                    facts.append(f"saved {_local_time(e['added_at'])}")
+                    if cur:
+                        facts.append(f"MRT {distance_label(cur['distance_to_mrt_m'])}")
+                        facts.append(f"school {distance_label(cur['distance_to_pri_school_m'])}")
+                        if cur.get("remaining_lease"):
+                            facts.append(f"lease {cur['remaining_lease']}")
+                    st.caption(" · ".join(facts))
+                    if cur is None and current_rows is not None:
+                        st.warning("No longer in the dataset (it may have been reloaded or "
+                                   "deleted). Showing what was saved.", icon=":material/warning:")
+                    n1, n2, n3 = st.columns([5, 1.2, 1.2], vertical_alignment="bottom")
+                    note = n1.text_input("Note", value=e.get("note", ""), max_chars=NOTE_MAX,
+                                         key=f"ff_sl_note_{tid}", placeholder="Add a note…",
+                                         label_visibility="collapsed")
+                    if n2.button("Save note", key=f"ff_sl_savenote_{tid}", width="stretch",
+                                 disabled=note.strip() == e.get("note", "")):
+                        record(prefs.update_note(user, tid, note))
+                        ss.ff_flash = "Note saved"
+                        st.rerun()
+                    if n3.button("Remove", key=f"ff_sl_rm_{tid}", width="stretch",
+                                 icon=":material/delete:"):
+                        record(prefs.remove_from_shortlist(user, tid))
+                        ss.ff_flash = "Removed from your shortlist"
+                        st.rerun()
+
+            if st.button("Analyse my shortlist", key="ff_sl_insights",
+                         icon=":material/query_stats:"):
+                sl_insights, t = prefs.shortlist_insights(user)
+                record(t)
+                ss.ff_sl_insights_data = (user, sl_insights)
+            if ss.get("ff_sl_insights_data") and ss.ff_sl_insights_data[0] == user:
+                sl_insights = ss.ff_sl_insights_data[1]
+                with st.container(border=True):
+                    j1, j2 = st.columns(2)
+                    for col, key, title in ((j1, "towns", "Towns on your shortlist"),
+                                            (j2, "flat_types", "Flat types on your shortlist")):
+                        sdf = pd.DataFrame(sl_insights[key])
+                        col.markdown(f"**{title}**")
+                        if not sdf.empty:
+                            col.bar_chart(sdf.set_index("_id")["flats"], horizontal=True,
+                                          color=BRAND, x_label="", y_label="flats")
+                    with st.expander("The MongoDB aggregation behind this",
+                                     icon=":material/code:"):
+                        st.code(json.dumps(prefs.shortlist_insights_pipeline(user), indent=2),
+                                language="json")
+
         st.markdown(f"### {user}'s searches")
         h1, h2 = st.columns(2)
         with h1.container(border=True, height="stretch"):
@@ -1249,8 +1404,9 @@ with tab_quick:
 
     elif qid == "floor_premium":
         st.caption("Average price per town for each storey range, and the increase "
-                   "over the range just below it (SQL: `LAG()` over a CTE; Mongo: "
-                   "`$group` then a step computed in Python).")
+                   "over the range just below it (SQL: `LAG()` over a subquery; Mongo: "
+                   "`$group` then `$setWindowFields` with `$shift`, so the step is "
+                   "computed inside the database on both engines).")
         p = _quick_filters("q9", storey=False, area=True, months=True)
         if st.button("Run", type="primary", key="run_q9"):
             _quick_run(qid, p, qe)
@@ -1310,6 +1466,74 @@ with tab_bench:
         st.dataframe(piv, width="stretch")
         st.caption("Substring and geographic benchmarks return distinct block counts on both engines.")
         st.dataframe(bf, width="stretch", hide_index=True)
+
+    # ---- index experiments (temporary copies only) ---------------------- #
+    st.divider()
+    with st.expander("Index experiments: what an index changes", icon=":material/science:"):
+        st.caption(
+            "Copies the first N sales into a **temporary** MongoDB collection (database "
+            f"`{experiments.EXPERIMENT_DB}`) and a PostgreSQL `TEMP` table, then times each "
+            "query with no index, with the index, and with the index rebuilt. The first run "
+            "of each mode is a warm-up and is left out of the median. Your real collection, "
+            "indexes and tables are never changed, and the copies are removed afterwards.")
+        ix_query_labels = {q.label: k for k, q in experiments.QUERIES.items()}
+        ix_size_labels = {f"{n:,}": n for n in (10_000, 50_000, 100_000)}
+        ix1, ix2, ix3 = st.columns([3, 2, 1])
+        ix_picked_q = ix1.multiselect("Queries", list(ix_query_labels),
+                                      default=list(ix_query_labels), key="ix_queries")
+        ix_picked_n = ix2.multiselect("Copy the first N sales", list(ix_size_labels),
+                                      default=["10,000", "50,000"], key="ix_sizes")
+        ix_repeats = ix3.number_input("Measured runs", 3, 25, 7, key="ix_repeats")
+        if not (pg_ok and mongo_ok):
+            st.warning("Both databases must be online to compare the two engines.")
+        if st.button("Run index experiment", type="primary", key="ix_run",
+                     icon=":material/play_arrow:",
+                     disabled=not (pg_ok and mongo_ok and ix_picked_q and ix_picked_n)):
+            try:
+                with st.spinner("Copying data and timing each mode…"):
+                    with stopwatch("index experiment (temporary copies)",
+                                   "postgres+mongodb") as ix_t:
+                        ix_res = experiments.run_experiments(
+                            mongo, pg, [ix_query_labels[x] for x in ix_picked_q],
+                            [ix_size_labels[x] for x in ix_picked_n], int(ix_repeats))
+                ix_t.rows = len(ix_res.samples)
+                record(ix_t)
+                st.session_state.ix_result = ix_res
+            except Exception as e:
+                st.error(f"Index experiment failed: {type(e).__name__}: {e}")
+
+        ix_res = st.session_state.get("ix_result")
+        if ix_res:
+            for note in ix_res.notes:
+                st.info(note)
+        if ix_res and ix_res.summary:
+            ix_df = pd.DataFrame(ix_res.summary)
+            ix_df["engine"] = ix_df["engine"].map(ENGINE_NAMES)
+            ix_df["query"] = ix_df["query"].map(
+                {k: q.label for k, q in experiments.QUERIES.items()})
+            st.markdown("**Median latency (shorter bar = faster)**")
+            st.altair_chart(_ix_chart(ix_df), width="content")
+            st.markdown("**What each plan did**")
+            st.dataframe(
+                ix_df[["engine", "size", "query", "mode", "median_ms", "p95_ms", "min_ms",
+                       "max_ms", "warmup_ms", "plan", "examined", "keys_examined",
+                       "returned", "engine_ms", "buffers", "index_build_ms"]],
+                hide_index=True, width="stretch",
+                column_config={c: st.column_config.NumberColumn(c, format="%.2f")
+                               for c in ("median_ms", "p95_ms", "min_ms", "max_ms",
+                                         "warmup_ms", "engine_ms", "index_build_ms")})
+            st.caption(
+                "`examined` = documents (MongoDB `totalDocsExamined`) or rows (PostgreSQL) "
+                "read; `keys_examined` is MongoDB index entries; `buffers` is PostgreSQL "
+                "pages touched. `engine_ms` is the engine's own execution time from "
+                "`explain` / `EXPLAIN ANALYZE`; the other ms columns are wall-clock "
+                "including fetching the rows. PostgreSQL may still choose a sequential scan "
+                "when the planner expects that to be cheaper: read the `plan` column.")
+            d1, d2 = st.columns(2)
+            d1.download_button("Download every run (CSV)", experiments.samples_to_csv(ix_res),
+                               "index_experiment_samples.csv", "text/csv", width="stretch")
+            d2.download_button("Download summary (CSV)", experiments.summary_to_csv(ix_res),
+                               "index_experiment_summary.csv", "text/csv", width="stretch")
 
 # -------------------------------------------------------------------- Notes -- #
 with tab_notes:

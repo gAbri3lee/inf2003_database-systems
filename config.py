@@ -15,8 +15,8 @@ from psycopg.conninfo import make_conninfo
 PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(PROJECT_DIR / ".env")
 
-# The trimmed source CSV ships in the project folder. Override with the
-# HDB_CSV environment variable or the sidebar field in the GUI.
+# Expected location of the trimmed source CSV (not tracked in Git: place your
+# copy here). Override with the HDB_CSV environment variable or the sidebar field.
 DEFAULT_CSV = PROJECT_DIR / "HDB_Compass_trimmed_updated.csv"
 CSV_PATH = Path(os.environ.get("HDB_CSV", DEFAULT_CSV))
 

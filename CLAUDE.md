@@ -97,8 +97,24 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   `PgRepo.score_flats` ranks sales with `PERCENT_RANK()` window functions over
   `v_transactions_full` (factors in `SCORE_FACTORS`), while
   [src/prefs.py](src/prefs.py) (`PrefsRepo`) stores user profiles, saved
-  searches and search history in MongoDB. Those live in a separate database
+  searches, search history and a per-user flat **shortlist** (`shortlists`
+  collection: PostgreSQL `transaction_id` by value + a snapshot; current rows
+  come back via `PgRepo.get_flats_by_ids`) in MongoDB. Those live in a separate database
   (`MONGO_USER_DB`, default `hdb_users`) for isolation. Reloads stage and replace only the transaction collection.
+  New `PrefsRepo` collections must be added to `VALIDATORS`/`INDEXES`; the
+  weight-repair migration in `ensure_schema` is limited to `WEIGHTED_COLLECTIONS`.
+* [src/experiments.py](src/experiments.py) powers the Benchmark tab's "Index
+  experiments" expander. It only ever works on temporary copies (a Mongo
+  collection in `hdb_experiments`, a PostgreSQL `TEMP` table) and removes them in
+  a `finally`; never point it at the real `transactions` collection/table.
+* [src/report.py](src/report.py) builds the "Save as PDF" sheet for the selected
+  Find a flat result (pure functions, no Streamlit/DB). The button passes a
+  callable to `st.download_button`, so the PDF and its OpenStreetMap map fetch
+  only happen on click; `fetch_map_image` returns `None` on any failure and the
+  PDF degrades to coordinates plus a map link. Tests inject fake tiles.
+* Quick search 9 (`floor_premium`) is a pure pipeline in `quick_mongo.py`
+  (`$setWindowFields`/`$shift`); keep `$round` inside pipelines since `_run`
+  rewrites it to PostgreSQL's ties-away-from-zero rounding (Mongo's own is ties-to-even).
 * The GUI pairs benchmark results across engines **by label**, so each
   operation must have the identical label in `PgRepo.benchmark` and
   `MongoRepo.benchmark`; put engine-specific detail in `Timing.extra["how"]`.

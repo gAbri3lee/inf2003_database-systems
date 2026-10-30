@@ -27,7 +27,7 @@ Docker Desktop.
 | PostgreSQL | portable, no install — binaries live in `vendor\pgsql`, cluster in `pgdata`, port **5433** | Windows can alternatively use portable binaries in `vendor\pgsql` and a cluster in `pgdata` |
 
 Runtime packages are `streamlit`, `pandas`, `pymongo`, `psycopg[binary]`,
-`python-dotenv`, `altair` and `pydeck`; their minimum versions are in
+`python-dotenv`, `altair`, `pydeck` and `fpdf2`; their minimum versions are in
 `requirements.txt`. For Windows:
 
 ```powershell
@@ -103,7 +103,7 @@ Streamlit opens `http://localhost:8501`.
 
 4. Start the GUI:
 
-   ```
+   ```bash
    python -m streamlit run app.py
    ```
 
@@ -134,10 +134,11 @@ database is already using port 5433 or 27017.
 
 ## 4. Using the GUI
 
-1. **Sidebar → ② Build & load** — point at the CSV (defaults to
-   `HDB_Compass_trimmed_updated.csv` in the project folder; override with the
-   `HDB_CSV` environment variable), optionally cap the row count for a quick
-   run, then **Build schema + load CSV**. Per-stage timings appear on the
+1. **Sidebar → Load data** (expanded automatically while the databases are
+   empty) — set the CSV path (defaults to `HDB_Compass_trimmed_updated.csv` in
+   the project folder; override with the `HDB_CSV` environment variable),
+   optionally cap the row count for a quick run, then click
+   **Build schema + load CSV**. Per-stage timings appear on the
    **Overview** tab.
 2. **Find a flat tab** — the buyer-facing part of the app.
    * Pick towns, flat types, budget, minimum size / lease, and how far back to
@@ -152,6 +153,25 @@ database is already using port 5433 or 27017.
    named searches, reload past searches, and run **Analyse my search
    history** (a MongoDB `$facet` aggregation). All of this is stored in
    MongoDB.
+   * **Save as PDF** — the button under the score breakdown downloads a
+   two-page PDF of the selected flat: address, price, score, size, lease, a
+   map with the block marked, the nearest MRT / school / hawker / park / CBD
+   with distances and walking times, how the score was made up (using your
+   weights), and your shortlist note if you saved one. It is built from the
+   result already on screen, so it needs no profile. The map is fetched from
+   OpenStreetMap tiles only when you click the button (the block's location
+   is sent in those tile requests); if the map service can't be reached, the
+   PDF prints the coordinates and a Google Maps link instead.
+   * **Shortlist** — with a profile selected, click a result row and then
+   **Add to shortlist** (next to its score breakdown) to keep that specific
+   flat. **`<profile>'s shortlist`** (below the results) lists up to 20 saved flats
+   with a note you can edit, the score when saved (and the current score if
+   it is in the current results), distances and lease, and a **Remove**
+   button; **Analyse my shortlist** is a `$facet` aggregation over the towns
+   and flat types you saved. Each entry stores the PostgreSQL
+   `transaction_id` by value plus a snapshot of the sale, so it survives
+   data reloads; a sale that is no longer in the dataset is flagged instead of
+   hidden. Guests (no profile) cannot save flats.
 3. **CRUD tab** — pick *PostgreSQL*, *MongoDB* or *Both*, then Read / Create /
    Update / Delete a transaction. Each operation prints its millisecond time and
    is appended to the sidebar **operation log** (downloadable as CSV).
@@ -159,15 +179,35 @@ database is already using port 5433 or 27017.
    month window, distance to MRT, street substring, optional geo radius), run it
    on either engine, and see the generated **SQL** vs the **Mongo query
    document** side by side, with timings and an optional query plan.
-5. **Benchmark tab** — repeats a fixed set of operations (point lookup, indexed
-   range scan, grouped aggregates, a 7-table join / no-join read, substring
-   search, geo radius, bulk update) N times and charts the median latency per
-   engine with a speed-up column. Both engines run the same 8 operations; the
-   `how` column says how each engine executes them. The bulk update leaves the
+5. **Benchmark tab** — repeats a fixed set of operations N times and charts
+   the median latency per engine with a speed-up column. Both engines run the
+   same 8 operations: point lookup by id, indexed range scan (price), group-by
+   town aggregate, monthly price trend, top-20 by price in one town (an
+   8-table view join in PostgreSQL vs. embedded documents in MongoDB), substring
+   search on street, geo radius (1 km) and a bulk update. The `how` column says
+   how each engine executes them.
+
+   **Index experiments** (expander at the bottom of the tab) shows what an
+   index changes. It copies the first N sales (10k / 50k / 100k) into a
+   temporary MongoDB collection in the separate `hdb_experiments` database
+   and a PostgreSQL `TEMP` table, then times three queries (town equals,
+   narrow price range, top-20 by price within a town) with **no index**
+   (MongoDB `hint({$natural: 1})` / PostgreSQL before any index), with the
+   **index**, and with the index **rebuilt**. The first run of each mode is a
+   warm-up and is excluded from the median/p95. The plan table shows the
+   winning plan (`COLLSCAN` vs `IXSCAN`, `Seq Scan` vs index scans), documents
+   or rows examined, keys examined and buffers; both the per-run samples and
+   the summary download as CSV. The real collection, its indexes and the real
+   tables are never modified, and the copies are removed afterwards (even if
+   a run fails). PostgreSQL may still choose a sequential scan with an index
+   when it expects that to be cheaper — the plan column shows it. The bulk update leaves the
    data unchanged (rolled back in PostgreSQL, a scratch field removed in
    MongoDB).
 6. **Quick search tab** — aggregate, distance, historical-price,
    storey-premium and model-exclusion queries, available on either PostgreSQL or MongoDB.
+   The storey-premium query (no. 9) runs entirely inside each engine: SQL uses
+   `LAG() OVER (PARTITION BY town ...)`, MongoDB uses `$setWindowFields` with
+   `$shift` (MongoDB 5.0+), with ties rounded away from zero on both.
    Distance limits use unrounded metres; displayed values are rounded afterwards.
    The  `distance` column shows **rounded distance in metres ** and **kilometres to 2 decimal places** 
    (for example, `950 m`, `1.25 km`, `3.00 km`), alongside estimated walking time in
@@ -241,7 +281,9 @@ An optional `$jsonSchema` validator enforces required fields / positive prices.
 ### MongoDB (user data, database `hdb_users`)
 
 Kept in a separate database for isolation. Reloads replace only the transaction collection.
-Each collection has a `$jsonSchema` validator (weights must be integers 0–100).
+Each collection has a `$jsonSchema` validator (weights must be integers 0–100;
+shortlist entries require `user`, `transaction_id` and `added_at`, and a note of
+at most 500 characters).
 
 ```jsonc
 // users            — unique index on name
@@ -255,6 +297,16 @@ Each collection has a `$jsonSchema` validator (weights must be integers 0–100)
 { "user": "Matthias", "name": "Near my parents", "weights": {...},
   "filters": {...}, "created_at": ISODate }
 
+// shortlists       — unique index {user, transaction_id}, index {user, added_at desc}
+{ "user": "Matthias", "transaction_id": "TX_...",   // PostgreSQL id, by value
+  "block_id": "HDB_...", "note": "Near my parents",
+  "snapshot": { "town": "BISHAN", "block_no": "192", "street_name": "BISHAN ST 13",
+                "flat_type": "4 ROOM", "storey_range": "10 TO 12",
+                "floor_area_sqm": 93.0, "resale_price": 550000.0,
+                "sold_month": ISODate },
+  "score_when_saved": 78.0, "weights_when_saved": {...},
+  "added_at": ISODate, "updated_at": ISODate }       // max 20 per user
+
 // search_history   — index {user, searched_at desc}
 { "user": "Matthias", "weights": {...}, "filters": {...}, "result_count": 50,
   "top_transaction_ids": ["TX_..."],   // PostgreSQL ids, referenced by value
@@ -266,23 +318,37 @@ Each collection has a `$jsonSchema` validator (weights must be integers 0–100)
 ```
 Project/
 ├─ app.py                 Streamlit GUI (all 7 tabs)
-├─ config.py              connection strings + paths (edit here)
-├─ requirements.txt
-├─ run_app.ps1            start PG (if needed) + launch Streamlit
+├─ config.py              connection strings + paths (override via env vars / .env)
+├─ requirements.txt       runtime dependencies
+├─ requirements-dev.txt   adds pytest
+├─ compose.yaml           PostgreSQL 16 (:5433) + MongoDB 8 (:27017) for macOS/Docker
+├─ .env.example           default connection settings
+├─ run_app.ps1            Windows: start PG (if needed) + launch Streamlit
 ├─ .streamlit/config.toml theme: colours, fonts, sidebar, chart palette
 ├─ assets/style.css       styles for the banner, result cards, timing badges
+├─ data/block_coordinates.json  source-attributed block coordinates
+├─ docs/                  actual-data-validation.json, merge-validation.md
 ├─ scripts/
-│  ├─ pg_setup.ps1        one-time initdb + createdb
+│  ├─ pg_setup.ps1        Windows: one-time initdb + createdb
 │  ├─ pg_start.ps1 / pg_stop.ps1
+│  ├─ launch.py           used by run_app.ps1
+│  └─ validate_actual.py  full-data validation (disposable test databases only)
 ├─ src/
 │  ├─ cleaning.py         CSV -> typed frame -> normalized tables / documents
-│  ├─ pg.py               PgRepo: schema, COPY load, CRUD, filter, benchmark
+│  ├─ pg.py               PgRepo: schema, COPY load, CRUD, filter, scoring, benchmark
 │  ├─ mongo.py            MongoRepo: schema+indexes, load, CRUD, filter, benchmark
-│  ├─ prefs.py            PrefsRepo: user profiles, saved searches, history
+│  ├─ prefs.py            PrefsRepo: user profiles, saved searches, history, shortlist
+│  ├─ experiments.py      index experiments on temporary copies (Benchmark tab)
+│  ├─ report.py           one-flat PDF (fpdf2) + OpenStreetMap map image
+│  ├─ quick.py / quick_mongo.py  the ten Quick search queries per engine
+│  ├─ mutations.py        write validation + paired PostgreSQL/MongoDB writes
 │  ├─ loader.py           run_load(): orchestrates both, collects timings
+│  ├─ distance.py, transaction_display.py, query_utils.py  display/query helpers
 │  └─ timing.py           stopwatch helpers
-└─ vendor/pgsql/          portable PostgreSQL 16 binaries
+├─ tests/                 pytest suite (synthetic data)
+└─ vendor/pgsql/          Windows only: portable PostgreSQL 16 binaries (not in Git)
 ```
+
 ## 7. Troubleshooting
 
 * **`PostgreSQL down`** in the sidebar → run `scripts\pg_start.ps1`. Check
@@ -292,7 +358,16 @@ Project/
 * **`MongoDB down`** → `Get-Service MongoDB` and `Start-Service MongoDB`.
 * **Reload from scratch** → just click *Build schema + load CSV* again; both
   projections are rebuilt with rollback/recovery on reported failures.
-* **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.
+* **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`
+  (macOS: `export HDB_CSV=/path/to.csv`).
+* **macOS / Docker: sidebar shows a database Offline** → make sure Docker Desktop
+  is running and `docker compose ps` lists both `postgres` and `mongo` as running;
+  inspect `docker compose logs postgres` / `docker compose logs mongo`.
+* **macOS / Docker: port 5433 or 27017 already in use** → stop the other local
+  database, or change the host side of the `ports:` mapping in `compose.yaml` and
+  set `PGPORT` / `MONGO_URI` (in `.env`) to match.
+* **The CSV is not in Git** (`*.csv` is ignored). Place your copy in the project
+  folder or point the sidebar / `HDB_CSV` at it.
 
 ## 8. Automated checks
 
@@ -301,6 +376,13 @@ not actual resale records. They cover all ten Quick Search query pairs, literal
 substring and distance boundaries, rounding parity, loading/projection, CRUD,
 ranking, profiles/history, schema reloads and benchmark result counts. Streamlit's
 AppTest runs all seven tabs and exercises Find a flat and all ten quick searches.
+`tests/test_new_features.py` adds the window-function storey query (matches
+PostgreSQL, tie rounding), the shortlist (add / duplicate / cap / notes /
+validator / survives a data reload / missing sale flag), the index experiments
+(plans, leaves the real collection and indexes untouched, cleans up after a
+failure) and a full GUI walkthrough of both. `tests/test_report.py` checks the
+PDF (content, missing values, the map and its offline fallback) with faked map
+tiles, so no network is needed.
 
 ```powershell
 python -m pip install -r requirements-dev.txt
@@ -315,6 +397,18 @@ Never point these settings at a production database.
 ```powershell
 $env:TEST_PG_DSN = 'host=127.0.0.1 port=55433 user=hdb_test dbname=hdb_test_merge'
 $env:TEST_MONGO_URI = 'mongodb://127.0.0.1:57017/'
+python -m pytest -q
+```
+
+Against the Docker Compose databases (macOS/Linux), create a disposable
+database inside the running PostgreSQL container and use the Compose
+credentials and ports (5433 / 27017):
+
+```bash
+docker compose exec postgres psql -U hdb -d hdb -c "CREATE DATABASE hdb_test_merge"
+export TEST_PG_DSN='host=localhost port=5433 user=hdb password=hdb dbname=hdb_test_merge'
+export TEST_MONGO_URI='mongodb://localhost:27017/'
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
@@ -372,8 +466,9 @@ python scripts/validate_actual.py "C:\path\to\HDB_Compass_trimmed_updated.csv"
 
 Create a separate PostgreSQL database such as `hdb_test_actual`, then set
 `TEST_PG_DSN` to it and `TEST_MONGO_URI` to a test MongoDB server beforehand.
-For Compose, use the credentials and ports in the test commands above, changing
-only the PostgreSQL database name. The script also replaces MongoDB
+For Compose, use the Compose credentials and ports from the bash example in
+section 8 (`hdb`/`hdb` on 5433, MongoDB on 27017), changing only the PostgreSQL
+database name to `hdb_test_actual`. The script also replaces MongoDB
 `hdb_test_actual` and `hdb_test_actual_prefs`. It reconciles all projected
 records, all ten query pairs, six distance metrics, actual-row updates and GUI
 queries.

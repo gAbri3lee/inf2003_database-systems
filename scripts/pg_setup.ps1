@@ -12,7 +12,7 @@ $pass    = "hdb"
 $dbname  = "hdb"
 
 if (-not (Test-Path (Join-Path $bin "initdb.exe"))) {
-    throw "Portable PostgreSQL not found at $bin. Extract vendor\pg-binaries.zip first."
+    throw "Portable PostgreSQL not found at $bin. Download the PostgreSQL 16 Windows binaries ZIP and extract it so vendor\pgsql\bin\initdb.exe exists (see README section 2)."
 }
 
 if (Test-Path (Join-Path $data "PG_VERSION")) {
