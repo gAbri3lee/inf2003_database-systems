@@ -140,18 +140,18 @@ database is already using port 5433 or 27017.
    run, then **Build schema + load CSV**. Per-stage timings appear on the
    **Overview** tab.
 2. **Find a flat tab** — the buyer-facing part of the app.
-   * Pick towns, flat types, budget, minimum size / lease, and how far back to
-     compare sales, then set a 0–100 weight for each priority (affordability,
-     MRT, primary school, hawker food, green space, city centre, lease left).
-   * **Find flats** ranks recent sales by a compatibility score computed in
-     PostgreSQL. Each factor is a percentile against every sale in the chosen
-     period (e.g. "closer to an MRT than 90% of flats"), and the score is the
-     weighted average. Click a row to see its score breakdown; the map
-     highlights it. *Show the SQL* reveals the query.
-   * Choose or create a **profile** to save your weights as defaults, save
-     named searches, reload past searches, and run **Analyse my search
-     history** (a MongoDB `$facet` aggregation). All of this is stored in
-     MongoDB.
+   Pick towns, flat types, budget, minimum size / lease, and how far back to
+   compare sales, then set a 0–100 weight for each priority (affordability,
+   MRT, primary school, hawker food, green space, city centre, lease left).
+   **Find flats** ranks recent sales by a compatibility score computed in
+   PostgreSQL. Each factor is a percentile against every sale in the chosen
+   period (e.g. "closer to an MRT than 90% of flats"), and the score is the
+   weighted average. Click a row to see its score breakdown; the map
+   highlights it. *Show the SQL* reveals the query.
+   Choose or create a **profile** to save your weights as defaults, save
+   named searches, reload past searches, and run **Analyse my search
+   history** (a MongoDB `$facet` aggregation). All of this is stored in
+   MongoDB.
 3. **CRUD tab** — pick *PostgreSQL*, *MongoDB* or *Both*, then Read / Create /
    Update / Delete a transaction. Each operation prints its millisecond time and
    is appended to the sidebar **operation log** (downloadable as CSV).
@@ -169,7 +169,7 @@ database is already using port 5433 or 27017.
 6. **Quick search tab** — aggregate, distance, historical-price,
    storey-premium and model-exclusion queries, available on either PostgreSQL or MongoDB.
    Distance limits use unrounded metres; displayed values are rounded afterwards.
-   The  `distance` column shows **rounded distance in metres below 1 km** and **kilometres to two decimal places** 
+   The  `distance` column shows **rounded distance in metres ** and **kilometres to 2 decimal places** 
    (for example, `950 m`, `1.25 km`, `3.00 km`), alongside estimated walking time in
    minutes, rounded up at 80 metres/minute. The estimate uses straight-line distance; actual walking routes and travel times can differ.
    The model exclusion is not a determination of buyer eligibility.
