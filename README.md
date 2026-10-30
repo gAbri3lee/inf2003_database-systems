@@ -81,7 +81,7 @@ Streamlit opens `http://localhost:8501`.
 2. In Terminal, enter the project folder and start the databases:
 
    ```bash
-   cd "/path/to/inf2003_database-systems-1"
+   cd "<project folder>"
    docker compose up -d
    docker compose ps
    ```
