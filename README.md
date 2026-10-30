@@ -140,15 +140,15 @@ database is already using port 5433 or 27017.
    run, then **Build schema + load CSV**. Per-stage timings appear on the
    **Overview** tab.
 2. **Find a flat tab** — the buyer-facing part of the app.
-   Pick towns, flat types, budget, minimum size / lease, and how far back to
+   * Pick towns, flat types, budget, minimum size / lease, and how far back to
    compare sales, then set a 0–100 weight for each priority (affordability,
    MRT, primary school, hawker food, green space, city centre, lease left).
-   **Find flats** ranks recent sales by a compatibility score computed in
+   * **Find flats** ranks recent sales by a compatibility score computed in
    PostgreSQL. Each factor is a percentile against every sale in the chosen
    period (e.g. "closer to an MRT than 90% of flats"), and the score is the
    weighted average. Click a row to see its score breakdown; the map
    highlights it. *Show the SQL* reveals the query.
-   Choose or create a **profile** to save your weights as defaults, save
+   * Choose or create a **profile** to save your weights as defaults, save
    named searches, reload past searches, and run **Analyse my search
    history** (a MongoDB `$facet` aggregation). All of this is stored in
    MongoDB.
@@ -175,10 +175,6 @@ database is already using port 5433 or 27017.
    The model exclusion is not a determination of buyer eligibility.
 7. **Notes tab** — a written summary of the strengths and weaknesses the
    prototype demonstrates.
-
-## 5. Data model
-
-### PostgreSQL (normalized)
 
 ## 5. Data model
 
