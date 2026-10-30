@@ -90,6 +90,14 @@ class PrefsRepo:
                 self.db.command("collMod", name, validator=validator)
             else:
                 self.db.create_collection(name, validator=validator)
+            # Preserve saved filters/history when restoring the original format.
+            # Older filter-only records no longer have priority weights.
+            self.db[name].update_many(
+                {"weights": {"$exists": False}},
+                {"$set": {"weights": {"afford": 70, "mrt": 60, "school": 40,
+                                     "hawker": 40, "park": 30, "cbd": 20, "lease": 50}}})
+            self.db[name].update_many({"preferences": {"$exists": True}},
+                                      {"$unset": {"preferences": ""}})
             for keys, kwargs in INDEXES[name]:
                 self.db[name].create_index(keys, **kwargs)
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from .mutations import updates
+from .mutations import normalize_create, updates
 
 import pandas as pd
 import psycopg
@@ -366,6 +366,7 @@ class PgRepo:
         return rows, t
 
     def create_transaction(self, data: dict):
+        data = normalize_create(data)
         with self.conn() as c, \
                 stopwatch("create (1 row, FK + CHECK enforced)", "postgres") as t:
             model_id = None

@@ -120,7 +120,8 @@ def mrt_by_town(repo, p, limit=None):
         {"$project": {"_id": 0, "town": "$_id", "blocks": "$n",
                       "avg_km_to_mrt": {"$round": [{"$divide": ["$avg", 1000]}, 2]},
                       "min_km": {"$round": [{"$divide": ["$lo", 1000]}, 2]},
-                      "max_km": {"$round": [{"$divide": ["$hi", 1000]}, 2]}}},
+                      "max_km": {"$round": [{"$divide": ["$hi", 1000]}, 2]},
+                      "avg_distance_m": "$avg", "min_distance_m": "$lo", "max_distance_m": "$hi"}},
         {"$sort": {"avg_km_to_mrt": 1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: avg MRT distance by town", pipe)
@@ -209,6 +210,7 @@ def distance_band(repo, p, limit=200):
                     "n": {"$sum": 1}, "avg": {"$avg": "$resale_price"}}},
         {"$project": {"_id": 0, "property_address": "$addr", "town": 1, "nearest": "$near",
                       "distance_km": {"$round": [{"$divide": ["$d", 1000]}, 2]},
+                      "distance_m": "$d",
                       "transactions": "$n", "avg_price": {"$round": ["$avg", 0]}}},
         {"$sort": {"distance_km": 1, "property_address": 1}}, *_limit(limit),
     ]
@@ -278,6 +280,7 @@ def singles(repo, p, limit=200):
         {"$project": {"_id": 0, "property_address": "$addr", "town": 1, "nearest_mrt": "$mrt",
                       "mrt_km": {"$round": [{"$divide": ["$mrt_d", 1000]}, 2]},
                       "bus_km": {"$round": [{"$divide": ["$bus_d", 1000]}, 2]},
+                      "mrt_distance_m": "$mrt_d", "bus_distance_m": "$bus_d",
                       "transactions": "$n", "avg_price": {"$round": ["$avg", 0]}}},
         {"$sort": {"mrt_km": 1, "bus_km": 1,"property_address":1,"town":1}}, *_limit(limit),
     ]

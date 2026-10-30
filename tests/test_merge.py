@@ -42,6 +42,33 @@ def test_quick_search_parity(repos,query,params):
     assert canonical(a)==canonical(b)
 
 
+@pytest.mark.parametrize('inside_distance,display_distance',[(123.45,0.12),(2999.99,3.0)])
+@pytest.mark.parametrize('metric,column,field', [
+    ('MRT station', 'distance_to_mrt_m', 'block.nearest.mrt.distance_m'),
+    ('Bus stop', 'bus_distance_m', 'block.nearest.bus.distance_m'),
+    ('Park', 'park_distance_m', 'block.nearest.park.distance_m'),
+    ('Hawker centre', 'hawker_distance_m', 'block.nearest.hawker.distance_m'),
+    ('Primary school', 'distance_to_pri_school_m', 'block.nearest.school.distance_m'),
+    ('CBD', 'distance_to_cbd_m', 'block.nearest.cbd.distance_m'),
+])
+def test_distance_band_uses_unrounded_metres_and_excludes_upper_boundary(repos,metric,column,field,inside_distance,display_distance):
+    from psycopg import sql
+    pg,mongo=repos
+    for i,distance in enumerate([inside_distance,3000,3000.01,None]):
+        block_id=f'TEST_BLOCK_{i}'
+        with pg.conn(autocommit=True) as conn:
+            conn.execute(sql.SQL('UPDATE blocks SET {} = %s WHERE block_id = %s').format(
+                sql.Identifier(column)),(distance,block_id))
+        mongo.coll.update_many({'block.block_id':block_id},{'$set':{field:distance}})
+    params={'metric':metric,'lo_m':0,'hi_m':3000}
+    expected_addresses={'1 TEST 0 ROAD'}
+    for registry,repo in [(quick.QUERIES,pg),(quick_mongo.QUERIES,mongo)]:
+        rows,_,_=registry['distance_band'](repo,params,None)
+        assert {r['property_address'] for r in rows}==expected_addresses
+        distances={r['property_address']:float(r['distance_km']) for r in rows}
+        assert distances=={'1 TEST 0 ROAD':display_distance}
+
+
 @pytest.mark.parametrize('params',[{}, {'towns':['TOWN A']}, {'flat_models':['3Gen']},
     {'price_max':400005}, {'max_dist_mrt':1000}, {'street_like':'TEST'},
     {'street_like':'%'}, {'month_from':dt.date(2025,4,1),'month_to':dt.date(2025,8,1)},

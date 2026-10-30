@@ -28,15 +28,18 @@ import altair as alt
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+from bson.json_util import dumps as bson_dumps
 
 import config
 from src import cleaning, quick, quick_mongo
+from src.distance import WALK_M_PER_MIN, distance_label, walking_minutes
 from src.loader import run_load
 from src.mutations import coordinated_write
 from src.mongo import MongoRepo
 from src.pg import SCORE_FACTORS, PgRepo
 from src.prefs import PrefsRepo
 from src.timing import Timing
+from src.transaction_display import mongo_transaction_row
 
 APP_NAME = "HomeWise SG"
 st.set_page_config(page_title=f"{APP_NAME} · HDB resale explorer",
@@ -257,17 +260,30 @@ def _ff_summary(f: dict) -> str:
 
 def _ff_card(rank: int, r: pd.Series) -> str:
     """HTML for one top-result card (styled by .hw-card in assets/style.css)."""
+    e = html.escape
+    walk_icon = '<i class="hw-walk-icon" role="img" aria-label="Walking"></i>'
+
     def metres(v):
         return "n/a" if pd.isna(v) else f"{v:,.0f} m"
 
+    def amenity_fact(label, value, name=''):
+        content = e(f'{label} {metres(value)}')
+        if name:
+            content += f' · {e(name)}'
+        minutes = walking_minutes(value)
+        tooltip = ''
+        if minutes is not None:
+            content += f' · {walk_icon} ~{minutes} min'
+            tooltip = ' title="Estimated walk at 80 metres/minute using straight-line distance; actual routes may differ."'
+        return f'<span{tooltip}>{content}</span>'
+
     station = (str(r["nearest_mrt"]).title().replace(" Mrt Station", "")
                .replace(" Lrt Station", " LRT") if pd.notna(r.get("nearest_mrt")) else "")
-    facts = [f"MRT {metres(r['distance_to_mrt_m'])}" + (f" · {station}" if station else ""),
-             f"School {metres(r['distance_to_pri_school_m'])}",
-             f"{r['floor_area_sqm']:.0f} sqm"]
+    facts = [amenity_fact('MRT', r['distance_to_mrt_m'], station),
+             amenity_fact('School', r['distance_to_pri_school_m']),
+             f"<span>{r['floor_area_sqm']:.0f} sqm</span>"]
     if pd.notna(r.get("remaining_lease_months")):
-        facts.append(f"{int(r['remaining_lease_months']) // 12} yrs lease")
-    e = html.escape
+        facts.append(f"<span>{int(r['remaining_lease_months']) // 12} yrs lease</span>")
     return (
         '<div class="hw-card">'
         f'<div class="hw-card-top"><span class="hw-rank">#{rank}</span>'
@@ -277,7 +293,7 @@ def _ff_card(rank: int, r: pd.Series) -> str:
         f'<div class="hw-sub">{e(str(r["town"]).title())} · {e(str(r["flat_type"]))} · '
         f'storey {e(str(r["storey_range"]))} · sold {pd.Timestamp(r["month"]):%b %Y}</div>'
         f'<div class="hw-price">${r["resale_price"]:,.0f}</div>'
-        '<div class="hw-facts">' + "".join(f"<span>{e(f)}</span>" for f in facts) + "</div>"
+        '<div class="hw-facts">' + "".join(facts) + "</div>"
         "</div>"
     )
 
@@ -422,6 +438,7 @@ with st.sidebar:
                 st.session_state.report = rep
                 record(*rep.timings)
                 pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
+                st.session_state.pop('ff_result', None)
                 if rep.rejected_rows:
                     st.warning(f"Excluded {len(rep.rejected_rows)} invalid CSV rows; source unchanged.")
                     st.dataframe(pd.DataFrame(rep.rejected_rows))
@@ -455,6 +472,7 @@ if _stats:
 _first, _, _last = APP_NAME.rpartition(" ")
 st.html(
     '<div class="hw-hero">'
+    '<i class="hw-walk-font-preload" aria-hidden="true">&#xe000;</i>'
     f'<div class="hw-brand">{html.escape(_first)} <span>{html.escape(_last)}</span></div>'
     '<div class="hw-tagline">Find the HDB resale flat that fits your life. Rank real '
     'sales by price, transport, schools, food and green space, and see exactly why '
@@ -474,6 +492,12 @@ st.html(
      ":material/bolt: Quick search", ":material/speed: Benchmark",
      ":material/lightbulb: Notes"]
 )
+
+# Clear results from earlier UI versions before restoring the cloned screen.
+if not st.session_state.get("cloned_find_ui_restored"):
+    for state_key in ("ff_result", "ff_insights_data", "ff_loaded_profile", "ff_pending", "prefs_ready"):
+        st.session_state.pop(state_key, None)
+    st.session_state.cloned_find_ui_restored = True
 
 # -------------------------------------------------------------- Find a flat -- #
 with tab_find:
@@ -549,7 +573,7 @@ with tab_find:
 
     with right_panel.container(border=True, height="stretch"):
         st.markdown("##### :material/tune: What matters to you?")
-        st.caption("Drag each slider: 0 = don't care, 100 = essential.")
+        st.caption("Drag each slider: 0 = not important, 100 = essential.")
         factor_keys = list(FACTORS)
         for i in range(0, len(factor_keys), 2):
             for col, k in zip(st.columns(2), factor_keys[i:i + 2]):
@@ -800,14 +824,22 @@ with tab_crud:
                 if "postgres" in engines:
                     rows, t = pg.get_transaction(tid); record(t); show_timing(t)
                     if rows:
-                        st.dataframe(pd.DataFrame(rows), width="stretch")
+                        st.dataframe(pd.DataFrame(rows), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                    else:
+                        st.info('No transaction found in PostgreSQL for this ID.')
                 if "mongodb" in engines:
                     doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
                     if doc:
-                        st.json(doc, expanded=False)
+                        st.dataframe(pd.DataFrame([mongo_transaction_row(doc)]), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                        with st.expander('MongoDB document'):
+                            st.json(bson_dumps(doc), expanded=False)
+                    else:
+                        st.info('No transaction found in MongoDB for this ID.')
                 if target == "Both":
-                    st.caption("SQL returns a flat row assembled from 8 tables; "
-                               "MongoDB returns the whole nested document in one hit.")
+                    st.caption("Both tables use the same columns. PostgreSQL reads its joined view; "
+                               "MongoDB's embedded fields are flattened for display.")
             except Exception as e:
                 st.error(f"Read failed: {type(e).__name__}: {e}")
 
@@ -854,6 +886,8 @@ with tab_crud:
                 doc=_mongo_doc_from_input(mongo,data) if 'mongodb' in engines else None
                 for t in coordinated_write(pg,mongo,engines,'create',new_id,data,doc): record(t);show_timing(t)
                 _cached_summary.clear()
+                mongo_distinct.clear()
+                st.session_state.pop('ff_result', None)
                 st.session_state.last_id=new_id
             except Exception as e:
                 st.error(f'Create failed: {type(e).__name__}: {e}')
@@ -876,6 +910,8 @@ with tab_crud:
                 try:
                     for t in coordinated_write(pg,mongo,engines,'update',tid,{field:val}): record(t);show_timing(t)
                     _cached_summary.clear()
+                    mongo_distinct.clear()
+                    st.session_state.pop('ff_result', None)
                 except Exception as e:
                     st.error(f'Update failed: {type(e).__name__}: {e}')
 
@@ -886,6 +922,8 @@ with tab_crud:
             try:
                 for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
                 _cached_summary.clear()
+                mongo_distinct.clear()
+                st.session_state.pop('ff_result', None)
             except Exception as e:
                 st.error(f'Delete failed: {type(e).__name__}: {e}')
 
@@ -927,7 +965,7 @@ with tab_filter:
     sort_by = c9.selectbox("Sort by", ["resale_price", "month", "price_per_sqm",
                                        "floor_area_sqm"])
     sort_desc = c10.checkbox("Descending", value=True)
-    limit = c11.number_input("Limit", min_value=1, max_value=5000, value=200, step=50)
+    limit = c11.number_input("Limit by entries", min_value=1, max_value=5000, value=200, step=50)
 
     params = dict(
         towns=towns, flat_types=flat_types, flat_models=flat_models,
@@ -946,23 +984,33 @@ with tab_filter:
         cols = st.columns(len(engines))
         for col, eng in zip(cols, engines):
             with col:
-                if eng == "postgres":
-                    rows, t, q = pg.filter(params, int(limit)); record(t)
-                    show_timing(t)
-                    st.code(q, language="sql")
-                    if rows:
-                        st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
-                    if show_plan:
-                        st.text(pg.explain_last())
-                else:
-                    docs, t, q = mongo.filter(params, int(limit)); record(t)
-                    show_timing(t)
-                    st.code(json.dumps(q, default=str, indent=2), language="json")
-                    if docs:
-                        st.dataframe(pd.json_normalize(docs), width="stretch",
-                                     height=360)
-                    if show_plan:
-                        st.json(mongo.explain_last())
+                try:
+                    if eng == "postgres":
+                        rows, t, q = pg.filter(params, int(limit)); record(t)
+                        show_timing(t)
+                        if not rows:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(q, language="sql")
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
+                        if show_plan:
+                            st.text(pg.explain_last())
+                    else:
+                        docs, t, q = mongo.filter(params, int(limit)); record(t)
+                        show_timing(t)
+                        if not docs:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(json.dumps(q, default=str, indent=2), language="json")
+                        if docs:
+                            st.dataframe(pd.json_normalize(docs), width="stretch",
+                                         height=360)
+                        if show_plan:
+                            st.json(mongo.explain_last())
+                except Exception as exc:
+                    name = "PostgreSQL" if eng == "postgres" else "MongoDB"
+                    st.error(f"{name} filter failed: {type(exc).__name__}: {exc}")
         if fe == "Both":
             st.info("Same predicate, two engines. Note the SQL text vs the Mongo "
                     "query document, and compare the millisecond figures above.")
@@ -974,11 +1022,12 @@ QUICK_BANDS = {
     "CBD": [("Under 5 km", 0, 5000), ("5 – 10 km", 5000, 10000),
             ("Over 10 km", 10000, None)],
 }
-_w5, _w10 = 5 * quick.WALK_M_PER_MIN, 10 * quick.WALK_M_PER_MIN
-for _m in ("MRT station", "Bus stop", "Park", "Hawker centre"):
-    QUICK_BANDS[_m] = [(f"Within 5 min walk (< {_w5} m)", 0, _w5),
-                       (f"5 – 10 min walk ({_w5} – {_w10} m)", _w5, _w10),
-                       (f"Over 10 min walk (> {_w10} m)", _w10, None)]
+for _metric in ("MRT station", "Bus stop", "Park", "Hawker centre"):
+    QUICK_BANDS[_metric] = [
+        ("Within 5 min walk (< 400 m)", 0, 400),
+        ("5 – 10 min walk (400 – 800 m)", 400, 800),
+        ("Over 10 min walk (> 800 m)", 800, None),
+    ]
 
 QUICK_LABELS = {
     "price_extremes": "1 · Cheapest / priciest per sqm by town",
@@ -987,7 +1036,7 @@ QUICK_LABELS = {
     "segment_prices": "4 · Min / max price by flat segment (older sales)",
     "recent_prices": "5 · Sales within / older than N years",
     "lease_by_postal": "6 · Shortest remaining lease by postal code",
-    "distance_band": "7 · Distance bands (school, MRT, bus, park, hawker, CBD)",
+    "distance_band": "7 · Nearby amenities (school, MRT, bus, park, hawker, CBD)",
     "flat_age": "8 · Age of flat (filter out old blocks)",
     "floor_premium": "9 · Price step per storey range (nested)",
     "singles": "10 · Singles: MRT & bus distance (view, no 3Gen)",
@@ -1043,7 +1092,57 @@ def _quick_run(qid: str, params: dict, engine_choice: str, limit=None):
             with st.expander("Query"):
                 st.code(q, language="sql" if eng == "postgres" else "json")
             if rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
+                frame = pd.DataFrame(rows)
+                column_config = {}
+                for field, label in {"property_address": "Property Address", "town": "Town",
+                                     "transactions": "Transactions"}.items():
+                    if field in frame:
+                        column_config[field] = st.column_config.Column(label)
+                if "avg_price" in frame:
+                    column_config["avg_price"] = st.column_config.NumberColumn(
+                        "Average price ($)", format="dollar", step=1,
+                        help="Average resale price in Singapore dollars (SGD).")
+                if qid == "mrt_by_town":
+                    for km_column, metre_column, label in [
+                        ("avg_km_to_mrt", "avg_distance_m", "Average Distance"),
+                        ("min_km", "min_distance_m", "Min Distance"),
+                        ("max_km", "max_distance_m", "Max Distance"),
+                    ]:
+                        metres = (frame.pop(metre_column) if metre_column in frame
+                                  else pd.to_numeric(frame[km_column], errors="coerce") * 1000)
+                        frame = frame.rename(columns={km_column: label})
+                        frame[label] = metres.map(distance_label)
+                if qid == "singles":
+                    frame = frame.rename(columns={"nearest_mrt": "Nearest MRT Station"})
+                    for km_column, metre_column, label in [
+                        ("mrt_km", "mrt_distance_m", "Distance to Nearest MRT"),
+                        ("bus_km", "bus_distance_m", "Distance to Nearest Bus Stop"),
+                    ]:
+                        metres = (frame.pop(metre_column) if metre_column in frame
+                                  else pd.to_numeric(frame[km_column], errors="coerce") * 1000)
+                        frame = frame.rename(columns={km_column: label})
+                        frame[label] = metres.map(distance_label)
+                if qid == "distance_band":
+                    # Older query modules may still return only kilometres after
+                    # Streamlit reloads app.py in an existing process.
+                    metres = (frame.pop("distance_m") if "distance_m" in frame
+                              else pd.to_numeric(frame["distance_km"], errors="coerce") * 1000)
+                    frame = frame.rename(columns={"distance_km": "distance"})
+                    frame["distance"] = metres.map(distance_label)
+                    nearest_label = {
+                        "MRT station": "Nearest MRT/LRT", "Primary school": "Nearest School",
+                        "Bus stop": "Nearest Bus Stop", "Park": "Nearest Park",
+                        "Hawker centre": "Nearest Hawker Centre", "CBD": "Nearest CBD",
+                    }[params["metric"]]
+                    column_config["nearest"] = st.column_config.Column(nearest_label)
+                    column_config["distance"] = st.column_config.Column("Distance")
+                    frame["Estimated Travel Time (mins)"] = pd.array(
+                        metres.map(walking_minutes), dtype="Int64")
+                    column_config["Estimated Travel Time (mins)"] = st.column_config.NumberColumn(
+                        "\ue000 Estimated Travel Time (mins)", format="%d", width=290,
+                        help="Estimated walking time at 80 metres/minute, rounded up. "
+                             "Based on straight-line distance; actual routes and travel times may differ.")
+                st.dataframe(frame, width="stretch", height=360, column_config=column_config)
             else:
                 st.info("No rows matched.")
 
@@ -1065,7 +1164,7 @@ with tab_quick:
 
     elif qid == "mrt_by_town":
         st.caption("`AVG(distance_to_mrt)` `GROUP BY town`, one value per block "
-                   "(not per transaction). Distances in km.")
+                   "(not per transaction).")
         p = _quick_filters("q2", types=False, models=False, storey=False)
         if st.button("Run", type="primary", key="run_q2"):
             _quick_run(qid, p, qe)
@@ -1077,7 +1176,7 @@ with tab_quick:
         c1, c2, c3 = st.columns(3)
         p["address_like"] = c1.text_input("Address contains", key="q3_addr") or None
         p["min_count"] = c2.number_input("Min transactions", 1, 1000, 1, key="q3_min")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q3_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q3_lim")
         if st.button("Run", type="primary", key="run_q3"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1089,7 +1188,7 @@ with tab_quick:
         c1, c2 = st.columns(2)
         p["older_than_months"] = c1.number_input("Only sales older than (months)",
                                                  0, 120, 6, key="q4_old")
-        lim = c2.number_input("Limit", 10, 5000, 500, step=50, key="q4_lim")
+        lim = c2.number_input("Limit by entries", 10, 5000, 500, step=50, key="q4_lim")
         if st.button("Run", type="primary", key="run_q4"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1103,7 +1202,7 @@ with tab_quick:
             key="q5_win") == "older than" else "within"
         p["years"] = c2.number_input("Years", 1, 20, 5, key="q5_years")
         p["sort_by"] = c3.selectbox("Sort by", ["month", "resale_price"], key="q5_sort")
-        lim = c4.number_input("Limit", 10, 5000, 200, step=50, key="q5_lim")
+        lim = c4.number_input("Limit by entries", 10, 5000, 200, step=50, key="q5_lim")
         if st.button("Run", type="primary", key="run_q5"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1116,21 +1215,23 @@ with tab_quick:
                                            key="q6_pp") or None
         p["max_lease_years"] = c2.number_input("Only if shortest lease ≤ (years)",
                                                1, 99, 99, key="q6_max")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q6_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q6_lim")
         if st.button("Run", type="primary", key="run_q6"):
             _quick_run(qid, p, qe, int(lim))
 
     elif qid == "distance_band":
-        st.caption(f"Blocks grouped by how far the nearest amenity is. Walking "
-                   f"time assumes ~{quick.WALK_M_PER_MIN} m/min (≈ 4.8 km/h) over "
-                   f"straight-line distance. Actual routes and travel times can differ substantially.")
+        st.caption(f"Find blocks by distance to the nearest amenity. "
+                   f"Estimated walking "
+                   f"time uses {WALK_M_PER_MIN} m/min (4.8 km/h), rounded up to whole minutes, "
+                   f"over straight-line distance. Actual routes and travel times may differ.")
         c1, c2 = st.columns(2)
         metric = c1.selectbox("Nearest…", list(quick.METRICS), key="q7_metric")
         bands = QUICK_BANDS[metric]
-        band = c2.radio("Band", [b[0] for b in bands], key=f"q7_band_{metric}")
-        _, lo, hi = next(b for b in bands if b[0] == band)
+        selected = c2.radio("Distance range", [b[0] for b in bands],
+                            key=f"q7_band_{metric}", label_visibility="collapsed")
+        _, lo, hi = next(b for b in bands if b[0] == selected)
         p = _quick_filters("q7", models=False, storey=False, months=True)
-        lim = st.number_input("Limit", 10, 5000, 200, step=50, key="q7_lim")
+        lim = st.number_input("Limit by entries", 10, 5000, 200, step=50, key="q7_lim")
         p.update(metric=metric, lo_m=lo, hi_m=hi)
         if st.button("Run", type="primary", key="run_q7"):
             _quick_run(qid, p, qe, int(lim))
@@ -1142,7 +1243,7 @@ with tab_quick:
         c1, c2, c3 = st.columns(3)
         p["max_age"] = c1.number_input("Max age (years)", 0, 100, 30, key="q8_max")
         p["min_age"] = c2.number_input("Min age (years)", 0, 100, 0, key="q8_min")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q8_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q8_lim")
         if st.button("Run", type="primary", key="run_q8"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1157,14 +1258,15 @@ with tab_quick:
     elif qid == "singles":
         st.caption("Explore sales excluding 3Gen and Multi-Generation models. "
                    "PostgreSQL uses `v_singles_resale`; MongoDB applies the same "
-                   "exclusion. This model filter is not a buyer-eligibility check. Distances in km.")
+                   "exclusion. This model filter is not a buyer-eligibility check.")
         p = _quick_filters("q10", models=False, storey=False, months=True)
         c1, c2, c3 = st.columns(3)
-        p["max_mrt_km"] = c1.number_input("Max km to MRT (0 = any)", 0.0, 20.0, 0.0,
+        p["max_mrt_km"] = c1.number_input("Maximum distance to MRT (km)", 0.0, 20.0, 0.0,
                                           step=0.1, key="q10_mrt") or None
-        p["max_bus_km"] = c2.number_input("Max km to bus stop (0 = any)", 0.0, 20.0, 0.0,
+        p["max_bus_km"] = c2.number_input("Maximum distance to bus stop (km)", 0.0, 20.0, 0.0,
                                           step=0.1, key="q10_bus") or None
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q10_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q10_lim")
+        st.caption("Enter maximum distances in kilometres (e.g. 0.5 = 500 m). Use 0 for no distance limit.")
         if st.button("Run", type="primary", key="run_q10"):
             _quick_run(qid, p, qe, int(lim))
 

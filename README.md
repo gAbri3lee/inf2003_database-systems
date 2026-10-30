@@ -9,23 +9,30 @@ transactions CSV into **two** databases from one dataset:
   carries its block, MRT, hawker, park and school context inline).
 
 The Streamlit GUI does **CRUD** and **filtering** on either or both engines and
-**times every operation**, plus a benchmark tab that contrasts where each model
-wins.
+**shows operation timings**, plus a benchmark tab for comparing the two models
+on the same local workloads.
 
 ---
 
 ## 1. Requirements
 
-| Component | This machine | Notes |
-|---|---|---|
-| Python | 3.11 | `pip install -r requirements.txt` |
-| MongoDB Server | 8.x, already installed & running as a Windows service on `localhost:27017` | no auth |
-| PostgreSQL | **portable**, no install — binaries live in `vendor\pgsql`, cluster in `pgdata`, port **5433** | started by a script, no admin rights, no Windows service |
+The PowerShell and portable PostgreSQL instructions below are for Windows.
+For macOS, follow [macOS setup](#macos-setup-docker), which uses Python and
+Docker Desktop. 
 
-Python packages: `streamlit`, `pandas`, `pymongo`, `psycopg[binary]`.
+| Component | Configuration | Notes |
+|---|---|---|
+| Python | Python 3.11 or newer | `pip install -r requirements.txt` in a virtual environment |
+| MongoDB Server | MongoDB 8.X already installed and running on`localhost:27017` | no authentication |
+| PostgreSQL | portable, no install — binaries live in `vendor\pgsql`, cluster in `pgdata`, port **5433** | Windows can alternatively use portable binaries in `vendor\pgsql` and a cluster in `pgdata` |
+
+Runtime packages are `streamlit`, `pandas`, `pymongo`, `psycopg[binary]`,
+`python-dotenv`, `altair` and `pydeck`; their minimum versions are in
+`requirements.txt`. For Windows:
 
 ```powershell
-python -m pip install --user -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## 2. One-time setup — portable PostgreSQL
@@ -41,18 +48,15 @@ cd "<project folder>"
 powershell -ExecutionPolicy Bypass -File scripts\pg_setup.ps1
 ```
 
-This runs `initdb` into `pgdata\`, sets the port to 5433, starts the server and
-creates the `hdb` database. Connection details (all defaults, override via env
-vars or `config.py`):
+This runs initdb into  `pgdata\`, sets the port to **5433**, starts the server and creates the hdb database. Connection details (all defaults, override via env vars or `config.py`):
 
 ```
 host=localhost  port=5433  user=hdb  password=hdb  dbname=hdb
 ```
-
 MongoDB needs nothing — the app connects to `mongodb://localhost:27017/`,
 database `hdb`, collection `transactions`.
 
-## 3. Run the app
+## 3. Run the app (Windows)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File run_app.ps1
@@ -66,6 +70,67 @@ python -m streamlit run app.py
 ```
 
 Streamlit opens `http://localhost:8501`.
+
+
+### macOS setup (Docker)
+
+1. Install **Python 3.11 or newer** and [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/).
+   Download Docker Desktop for your Mac's **Apple Silicon** or
+   **Intel**, then open Docker Desktop and wait until its engine is running.
+
+2. In Terminal, enter the project folder and start the databases:
+
+   ```bash
+   cd "/path/to/inf2003_database-systems-1"
+   docker compose up -d
+   docker compose ps
+   ```
+
+   The included `compose.yaml` runs PostgreSQL 16 on `localhost:5433` and
+   MongoDB 8 on `localhost:27017`. PostgreSQL's database, user and password are
+   all `hdb`; MongoDB has no authentication. These match `config.py` defaults,
+   so no `.env` file is required. If you already have one, check that it uses
+   the same settings as `.env.example`. Both database containers must stay
+   running while using the full app.
+
+3. Create a Python environment and install the required dependencies:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r requirements.txt
+   ```
+
+4. Start the GUI:
+
+   ```
+   python -m streamlit run app.py
+   ```
+
+   Open `http://localhost:8501`, expand **Load data** in the sidebar, and set
+   **CSV path** to your supplied CSV. The default filename is
+   `HDB_Compass_trimmed_updated.csv` in the project root; if your filename or
+   location differs, enter the actual path. Select both databases and click
+   **Build schema + load CSV**. Wait for loading to finish before querying.
+
+For subsequent setup, open Docker Desktop, then run these commands from the
+project folder (database data persists between container restarts):
+
+```bash
+docker compose up -d
+source .venv/bin/activate
+python -m streamlit run app.py
+```
+
+Press **Ctrl+C** to stop Streamlit. To stop the databases while preserving
+their data, run `docker compose stop`. Do not use `docker compose down -v`
+unless you intend to delete the stored databases.
+
+On macOS, use the commands above instead of `run_app.ps1`, the
+`scripts/pg_*.ps1` scripts or the Windows PostgreSQL binaries in `vendor/pgsql`.
+If a database fails to start, inspect `docker compose logs postgres` or
+`docker compose logs mongo`. A port conflict usually means another local
+database is already using port 5433 or 27017.
 
 ## 4. Using the GUI
 
@@ -101,12 +166,19 @@ Streamlit opens `http://localhost:8501`.
    `how` column says how each engine executes them. The bulk update leaves the
    data unchanged (rolled back in PostgreSQL, a scratch field removed in
    MongoDB).
-6. **Quick search tab** — ten canned aggregate, distance, historical-price,
-   storey-premium and model-exclusion queries, available on either engine or both.
+6. **Quick search tab** — aggregate, distance, historical-price,
+   storey-premium and model-exclusion queries, available on either PostgreSQL or MongoDB.
    Distance limits use unrounded metres; displayed values are rounded afterwards.
+   The  `distance` column shows **rounded distance in metres below 1 km** and **kilometres to two decimal places** 
+   (for example, `950 m`, `1.25 km`, `3.00 km`), alongside estimated walking time in
+   minutes, rounded up at 80 metres/minute. The estimate uses straight-line distance; actual walking routes and travel times can differ.
    The model exclusion is not a determination of buyer eligibility.
 7. **Notes tab** — a written summary of the strengths and weaknesses the
    prototype demonstrates.
+
+## 5. Data model
+
+### PostgreSQL (normalized)
 
 ## 5. Data model
 
@@ -215,7 +287,6 @@ Project/
 │  └─ timing.py           stopwatch helpers
 └─ vendor/pgsql/          portable PostgreSQL 16 binaries
 ```
-
 ## 7. Troubleshooting
 
 * **`PostgreSQL down`** in the sidebar → run `scripts\pg_start.ps1`. Check
@@ -226,7 +297,6 @@ Project/
 * **Reload from scratch** → just click *Build schema + load CSV* again; both
   projections are rebuilt with rollback/recovery on reported failures.
 * **CSV elsewhere** → set the path in the sidebar, or `setx HDB_CSV "C:\path\to.csv"`.
-
 
 ## 8. Automated checks
 
@@ -260,7 +330,6 @@ setup, and both engines round displayed aggregates with ties away from zero.
 
 The actual supplied CSV is validated separately by `scripts/validate_actual.py`; see `docs/actual-data-validation.json` for executed results.
 
-
 ## 9. Actual data and integrity fixes
 
 The supplied trimmed file has 171,924 source rows. Its incomplete final record
@@ -291,7 +360,6 @@ For a fresh installation with Docker available:
 docker compose up -d
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-# Place the supplied HDB_Compass_trimmed_updated.csv in this folder.
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
@@ -306,8 +374,13 @@ Full actual-data validation (use dedicated test databases only):
 python scripts/validate_actual.py "C:\path\to\HDB_Compass_trimmed_updated.csv"
 ```
 
-Set `TEST_PG_DSN` to the dedicated `hdb_test_actual` database and `TEST_MONGO_URI`
-to a test MongoDB server beforehand. The script reconciles all projected records,
-all ten query pairs, six distance metrics, actual-row updates and GUI queries.
+Create a separate PostgreSQL database such as `hdb_test_actual`, then set
+`TEST_PG_DSN` to it and `TEST_MONGO_URI` to a test MongoDB server beforehand.
+For Compose, use the credentials and ports in the test commands above, changing
+only the PostgreSQL database name. The script also replaces MongoDB
+`hdb_test_actual` and `hdb_test_actual_prefs`. It reconciles all projected
+records, all ten query pairs, six distance metrics, actual-row updates and GUI
+queries.
 
-CI pins Ubuntu 22.04 to avoid the documented MongoDB 8 incompatibility with certain newer Linux kernels. Docker also uses the host kernel; use a MongoDB-supported kernel if its container refuses startup.
+CI pins Ubuntu 22.04 to avoid the documented MongoDB 8 incompatibility with certain newer Linux kernels.
+Docker also uses the host kernel; use a MongoDB-supported kernel if its container refuses startup.
