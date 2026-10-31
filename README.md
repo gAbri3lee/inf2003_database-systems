@@ -37,10 +37,9 @@ python -m venv .venv
 
 ## 2. One-time setup — portable PostgreSQL
 
-Portable binaries and CSV data are not included in Git. Download the Windows
+Portable binaries are not included in Git. The cleaned CSV is tracked under `data/`. Download the Windows
 PostgreSQL 16 binary ZIP from [EnterpriseDB](https://www.enterprisedb.com/download-postgresql-binaries)
-and extract it so `vendor\pgsql\bin\pg_ctl.exe` exists. Supply your actual
-`HDB_Compass_trimmed_updated.csv` separately or set `HDB_CSV` to its path.
+and extract it so `vendor\pgsql\bin\pg_ctl.exe` exists. The application defaults to `data/HDB_Compass_trimmed_cleaned.csv`; set `HDB_CSV` only to use a different file.
 Initialise and start the local cluster:
 
 ```powershell
@@ -109,7 +108,7 @@ Streamlit opens `http://localhost:8501`.
 
    Open `http://localhost:8501`, expand **Load data** in the sidebar, and set
    **CSV path** to your supplied CSV. The default filename is
-   `HDB_Compass_trimmed_updated.csv` in the project root; if your filename or
+   `data/HDB_Compass_trimmed_cleaned.csv`; if your filename or
    location differs, enter the actual path. Select both databases and click
    **Build schema + load CSV**. Wait for loading to finish before querying.
 
@@ -135,8 +134,8 @@ database is already using port 5433 or 27017.
 ## 4. Using the GUI
 
 1. **Sidebar → Load data** (expanded automatically while the databases are
-   empty) — set the CSV path (defaults to `HDB_Compass_trimmed_updated.csv` in
-   the project folder; override with the `HDB_CSV` environment variable),
+   empty) — set the CSV path (defaults to `data/HDB_Compass_trimmed_cleaned.csv`;
+   override with the `HDB_CSV` environment variable),
    optionally cap the row count for a quick run, then click
    **Build schema + load CSV**. Per-stage timings appear on the
    **Overview** tab.
@@ -422,11 +421,26 @@ The actual supplied CSV is validated separately by `scripts/validate_actual.py`;
 
 ## 9. Actual data and integrity fixes
 
-The supplied trimmed file has 171,924 source rows. Its incomplete final record
-(CSV row 171925, including the header) is excluded with an explicit rejection
-report. The file itself is unchanged. Its price-per-sqm header mentions thousands,
-but the actual numeric values match SGD per sqm; do not multiply them by 1,000.
-Missing school/CBD values remain missing.
+The current default is `data/HDB_Compass_trimmed_cleaned.csv`: **171,131 rows and
+28 columns**, with no blank or recognized NA/NULL placeholders in the supplied
+columns. It preserves all retained cell values and duplicates from the original.
+The cleanup removed **793 rows**: 792 with missing school/CBD information and
+one incomplete final record. The original 171,924-row file was left unchanged.
+Removing records with missing enrichment also removes 93 blocks from the original
+loadable block universe; recommendation coverage is now the 9,616 retained blocks.
+
+See `data/cleaning_manifest.json` for source/output hashes and missing-value policy.
+Previous validation reports under `docs/` that identify the original source hash
+are historical results for the earlier dataset, not new results for this CSV.
+This cleanup does not resolve the separately identified difference in transaction
+coverage against the frozen official source. The price-per-sqm header mentions
+thousands, but its values are SGD per sqm; do not multiply them by 1,000.
+
+After pulling, restart the app and use **Build schema + load CSV** to refresh the
+databases. Existing loaded databases are not automatically changed. Clear an old
+`HDB_CSV` environment override if you want to use the new default. School and CBD
+fields are complete in the retained source rows; optional fields omitted entirely
+from this trimmed schema can still be null in the database projections.
 
 `data/block_coordinates.json` supplies the source-attributed September 2026
 OneMap coordinates removed during trimming. Lookup requires exact block/street
@@ -461,7 +475,7 @@ virtual environment and honors the database settings loaded from `.env`.
 Full actual-data validation (use dedicated test databases only):
 
 ```powershell
-python scripts/validate_actual.py "C:\path\to\HDB_Compass_trimmed_updated.csv"
+python scripts/validate_actual.py "data/HDB_Compass_trimmed_cleaned.csv"
 ```
 
 Create a separate PostgreSQL database such as `hdb_test_actual`, then set
