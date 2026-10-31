@@ -22,6 +22,7 @@ import math
 import statistics
 from dataclasses import dataclass, field
 from typing import Callable
+from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING
 
@@ -153,9 +154,9 @@ def _mongo_param_pick(coll) -> dict:
 
 def _run_mongo(repo: MongoRepo, db_name: str, size: int, qkeys, repeats: int,
                out: ExperimentResult, plans: dict) -> None:
-    name = f"tx_{size}"
+    # Each invocation owns its scratch collection, including during cleanup.
+    name = f"tx_{size}_{uuid4().hex}"
     target = repo.client[db_name]
-    target.drop_collection(name)
     try:
         # Copy only; the real collection is read, never written.
         list(repo.coll.aggregate([{"$sort": {"_id": 1}}, {"$limit": size},
@@ -212,7 +213,10 @@ def _pg_plan_stats(c, sql: str, params: dict) -> dict:
         "examined": examined, "keys_examined": None,
         "returned": plan.get("Actual Rows"),
         "engine_ms": round(root.get("Execution Time", 0), 3),
-        "buffers": plan.get("Shared Hit Blocks", 0) + plan.get("Shared Read Blocks", 0),
+        # Root counters include descendants; summing nodes would double count.
+        # PostgreSQL TEMP tables use local buffers rather than shared buffers.
+        "buffers": sum(plan.get(k, 0) for k in (
+            "Shared Hit Blocks", "Shared Read Blocks", "Local Hit Blocks", "Local Read Blocks")),
     }
 
 
@@ -271,6 +275,9 @@ def run_experiments(mongo: MongoRepo | None, pg: PgRepo | None, query_keys, size
         raise ValueError("The experiment database must differ from the application database.")
 
     out, plans = ExperimentResult(), {}
+    sizes = list(sizes)
+    if any(int(s) <= 0 for s in sizes):
+        raise ValueError("Experiment sizes must be positive.")
     available = []
     if mongo is not None:
         available.append(mongo.coll.estimated_document_count())

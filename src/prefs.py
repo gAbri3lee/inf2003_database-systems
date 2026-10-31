@@ -62,13 +62,14 @@ VALIDATORS = {
     }},
     "shortlists": {"$jsonSchema": {
         "bsonType": "object",
-        "required": ["user", "transaction_id", "added_at"],
+        "required": ["user", "transaction_id", "added_at", "slot"],
         "properties": {
             "user": {"bsonType": "string", "minLength": 1},
             # PostgreSQL transaction_id, stored by value (MongoDB can't enforce an FK)
             "transaction_id": {"bsonType": "string", "minLength": 1},
             "snapshot": {"bsonType": "object"},
             "note": {"bsonType": "string", "maxLength": NOTE_MAX},
+            "slot": {"bsonType": "int", "minimum": 0, "maximum": SHORTLIST_CAP - 1},
         },
     }},
 }
@@ -82,7 +83,10 @@ INDEXES = {
     "shortlists": [([("user", ASCENDING), ("transaction_id", ASCENDING)],
                     {"unique": True, "name": "ux_user_txn"}),
                    ([("user", ASCENDING), ("added_at", DESCENDING)],
-                    {"name": "ix_user_added"})],
+                    {"name": "ix_user_added"}),
+                   ([("user", ASCENDING), ("slot", ASCENDING)],
+                    {"unique": True, "name": "ux_user_slot",
+                     "partialFilterExpression": {"slot": {"$exists": True}}})],
 }
 
 # Only these predate the shortlist and carry priority weights; the one-off
@@ -154,6 +158,28 @@ class PrefsRepo:
                                           {"$unset": {"preferences": ""}})
             for keys, kwargs in INDEXES[name]:
                 self.db[name].create_index(keys, **kwargs)
+        self._migrate_shortlist_slots()
+
+    def _migrate_shortlist_slots(self) -> None:
+        """Preserve old entries while assigning bounded, unique per-user slots.
+
+        Conditional updates and the unique index also protect concurrent starts.
+        An already oversized legacy list is reported, never silently truncated.
+        """
+        for entry in self.shortlist.find({"slot": {"$exists": False}}):
+            for slot in range(SHORTLIST_CAP):
+                try:
+                    self.shortlist.update_one(
+                        {"_id": entry["_id"], "slot": {"$exists": False}},
+                        {"$set": {"slot": slot}})
+                    break
+                except DuplicateKeyError:
+                    continue
+            else:
+                # Another initializer may have assigned this entry already.
+                if self.shortlist.count_documents(
+                        {"_id": entry["_id"], "slot": {"$exists": False}}, limit=1):
+                    raise ValueError("A legacy shortlist exceeds 20 entries; remove extras before retrying.")
 
     # -------------------------------------------------- profiles ---------- #
     def profiles(self) -> list[str]:
@@ -250,17 +276,22 @@ class PrefsRepo:
                "snapshot": shortlist_snapshot(flat), "score_when_saved": float(score),
                "weights_when_saved": _weights(weights), "added_at": now,
                "updated_at": now, **({"note": note} if note else {})}
-        with stopwatch("shortlist: add flat (upsert)", "mongodb") as t:
+        with stopwatch("shortlist: add flat (bounded insert)", "mongodb") as t:
             if self.shortlist.count_documents(key, limit=1):
                 status = "already_saved"
-            elif self.shortlist.count_documents({"user": user}) >= SHORTLIST_CAP:
-                status = "full"
             else:
-                try:
-                    res = self.shortlist.update_one(key, {"$setOnInsert": doc}, upsert=True)
-                    status = "added" if res.upserted_id is not None else "already_saved"
-                except DuplicateKeyError:        # lost a race with another session
-                    status = "already_saved"
+                status = "full"
+                # The database arbitrates claims. No count-then-insert race,
+                # expiring lock, replica-set requirement or quota compensation.
+                for slot in range(SHORTLIST_CAP):
+                    try:
+                        self.shortlist.insert_one({**doc, "slot": slot})
+                        status = "added"
+                        break
+                    except DuplicateKeyError:
+                        if self.shortlist.count_documents(key, limit=1):
+                            status = "already_saved"
+                            break
         t.rows = 1 if status == "added" else 0
         return status, t
 
