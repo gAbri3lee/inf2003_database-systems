@@ -1,0 +1,2 @@
+# Preserve dataset bytes, quoting, BOM and line endings across platforms.
+data/HDB_Compass_trimmed_cleaned.csv -text whitespace=cr-at-eol
