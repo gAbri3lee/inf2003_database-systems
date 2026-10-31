@@ -315,7 +315,8 @@ def _ff_contrib_chart(r: pd.Series, weights: dict, active: list[str]) -> alt.Cha
     bars = base.mark_bar(color=BRAND, cornerRadiusEnd=5, size=20)
     labels = base.mark_text(align="left", dx=5, color=LABEL_GREY, fontSize=12,
                             fontWeight=600).encode(text=alt.Text("points:Q", format=".1f"))
-    return (bars + labels).properties(height=34 * len(active) + 30)
+    return (bars + labels).properties(height=34 * len(active) + 30,
+                                     padding={"left": 5, "right": 40, "top": 5, "bottom": 5})
 
 
 def _rgba(hex_colour: str, alpha: int = 255) -> list[int]:
@@ -382,7 +383,7 @@ def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
 
 
 def _ix_chart(df: pd.DataFrame) -> alt.Chart:
-    """Median latency per mode: one panel per query (rows) and copy size (columns).
+    """Responsive comparison for the selected query and copy size.
     symlog like _bench_chart, so a 0.5 ms and an 80 ms bar both stay readable."""
     data = df.assign(
         mode_label=df["mode"].map({"no index": "no index", "index": "index",
@@ -405,17 +406,8 @@ def _ix_chart(df: pd.DataFrame) -> alt.Chart:
     bars = base.mark_bar(cornerRadiusEnd=3)
     labels = base.mark_text(dy=-6, fontSize=10, color=LABEL_GREY).encode(
         text=alt.Text("median_ms:Q", format=",.1f"))
-    return (alt.layer(bars, labels, data=data)
-            .properties(width=230, height=110)
-            .facet(row=alt.Row("query:N", title=None,
-                               header=alt.Header(labelAngle=0, labelAlign="left",
-                                                 labelLimit=300, labelFontSize=13)),
-                   column=alt.Column("size_label:N", title=None,
-                                     sort=sorted(data["size_label"].unique(),
-                                                 key=lambda t: int(t.split()[0].replace(",", ""))),
-                                     header=alt.Header(labelFontSize=13)),
-                   title=alt.TitleParams("median ms per run (log-style scale; bar labels in ms)",
-                                         anchor="start", fontSize=12, color=LABEL_GREY)))
+    return alt.layer(bars, labels, data=data).properties(
+        height=220, padding={"left": 15, "right": 15, "top": 15, "bottom": 15})
 
 
 def _local_time(t: dt.datetime) -> str:
@@ -610,7 +602,7 @@ with tab_find:
         st.slider("Max budget (SGD)", 200_000, 2_000_000, step=10_000, key="ff_budget",
                   format="localized")
         c4, c5 = st.columns(2)
-        c4.number_input("Min floor area (sqm)", 0, 300, step=5, key="ff_area")
+        c4.number_input("Min floor area (sqm)", 0, 500, step=5, key="ff_area")
         c5.slider("Min lease left (years)", 0, 95, step=5, key="ff_lease")
         st.selectbox("Compare against sales from", MONTH_OPTS, key="ff_months",
                      format_func=lambda m: f"The last {m} months" if m else "All years (2020–2026)")
@@ -1005,7 +997,10 @@ with tab_crud:
                    "Try an unknown block_id or a negative price to see it reject.")
         with st.form("create_form"):
             g1, g2, g3 = st.columns(3)
-            new_id = g1.text_input("transaction_id", value=f"TX_demo_{uuid.uuid4().hex[:10]}")
+            # A changing default changes Streamlit's widget identity and can
+            # discard the submitted ID. Keep the draft default across reruns.
+            draft_id = st.session_state.setdefault("crud_draft_id", f"TX_demo_{uuid.uuid4().hex[:10]}")
+            new_id = g1.text_input("transaction_id", value=draft_id, key="crud_new_id")
             block_id = g2.text_input("block_id (must exist in blocks)",
                                      value=st.session_state.get("demo_block", ""))
             month = g3.date_input("month", value=dt.date(2025, 1, 1))
@@ -1100,7 +1095,7 @@ with tab_filter:
     c4, c5 = st.columns(2)
     price = c4.slider("Resale price (SGD)", 100_000, 1_800_000,
                       (300_000, 800_000), step=10_000)
-    area = c5.slider("Floor area (sqm)", 20, 300, (60, 130), step=5)
+    area = c5.slider("Floor area (sqm)", 20, 500, (60, 130), step=5)
     c6, c7, c8 = st.columns(3)
     mfrom = c6.date_input("Month from", value=dt.date(2020, 1, 1))
     mto = c7.date_input("Month to", value=dt.date(2026, 12, 1))
@@ -1221,7 +1216,7 @@ def _quick_filters(key, *, towns=True, types=True, models=True, storey=True,
             pg_distinct("storey_range") or mongo_distinct("storey_range"),
             key=f"{key}_sr"); i += 1
     if area:
-        a = st.slider("Floor area (sqm)", 20, 300, (20, 300), step=5, key=f"{key}_area")
+        a = st.slider("Floor area (sqm)", 20, 500, (20, 500), step=5, key=f"{key}_area")
         p["area_min"], p["area_max"] = a
     if months:
         m1, m2 = st.columns(2)
@@ -1512,7 +1507,14 @@ with tab_bench:
             ix_df["query"] = ix_df["query"].map(
                 {k: q.label for k, q in experiments.QUERIES.items()})
             st.markdown("**Median latency (shorter bar = faster)**")
-            st.altair_chart(_ix_chart(ix_df), width="content")
+            chart_q, chart_n = st.columns(2)
+            selected_query = chart_q.selectbox("Chart query", list(ix_df["query"].unique()), key="ix_chart_query")
+            selected_size = chart_n.selectbox("Chart copy size", sorted(ix_df["size"].unique()),
+                                              format_func=lambda n: f"{n:,} sales", key="ix_chart_size")
+            st.caption("Median ms per run on a log-style scale; bar labels are milliseconds. "
+                       "The table and CSVs below contain all selected experiments.")
+            st.altair_chart(_ix_chart(ix_df[(ix_df["query"] == selected_query) &
+                                          (ix_df["size"] == selected_size)]), width="stretch")
             st.markdown("**What each plan did**")
             st.dataframe(
                 ix_df[["engine", "size", "query", "mode", "median_ms", "p95_ms", "min_ms",
@@ -1525,10 +1527,14 @@ with tab_bench:
             st.caption(
                 "`examined` = documents (MongoDB `totalDocsExamined`) or rows (PostgreSQL) "
                 "read; `keys_examined` is MongoDB index entries; `buffers` is PostgreSQL "
-                "pages touched. `engine_ms` is the engine's own execution time from "
+                "shared + local buffer hits/reads (including TEMP tables). `engine_ms` is the engine's own execution time from "
                 "`explain` / `EXPLAIN ANALYZE`; the other ms columns are wall-clock "
                 "including fetching the rows. PostgreSQL may still choose a sequential scan "
-                "when the planner expects that to be cheaper: read the `plan` column.")
+                "when the planner expects that to be cheaper: read the `plan` column. "
+                "MongoDB forces the indicated scan/index via hint; PostgreSQL chooses its plan. "
+                "MongoDB returns embedded documents while PostgreSQL returns six columns: "
+                "use these experiments to compare index effects within each engine, "
+                "not to claim an equivalent-payload cross-engine speed ranking.")
             d1, d2 = st.columns(2)
             d1.download_button("Download every run (CSV)", experiments.samples_to_csv(ix_res),
                                "index_experiment_samples.csv", "text/csv", width="stretch")

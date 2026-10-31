@@ -198,7 +198,13 @@ database is already using port 5433 or 27017.
    or rows examined, keys examined and buffers; both the per-run samples and
    the summary download as CSV. The real collection, its indexes and the real
    tables are never modified, and the copies are removed afterwards (even if
-   a run fails). PostgreSQL may still choose a sequential scan with an index
+   a run fails). Each invocation has its own scratch collection, so simultaneous
+   experiments cannot overwrite or clean up each other's copies. PostgreSQL
+   buffers include shared and local hits/reads (TEMP tables use local buffers).
+   MongoDB forces its scan/index with a hint; PostgreSQL chooses its plan.
+   MongoDB fetches full embedded documents while PostgreSQL fetches six columns:
+   compare index effects within each engine, rather than claiming an equivalent
+   cross-engine payload comparison. PostgreSQL may still choose a sequential scan with an index
    when it expects that to be cheaper — the plan column shows it. The bulk update leaves the
    data unchanged (rolled back in PostgreSQL, a scratch field removed in
    MongoDB).
@@ -281,7 +287,7 @@ An optional `$jsonSchema` validator enforces required fields / positive prices.
 
 Kept in a separate database for isolation. Reloads replace only the transaction collection.
 Each collection has a `$jsonSchema` validator (weights must be integers 0–100;
-shortlist entries require `user`, `transaction_id` and `added_at`, and a note of
+shortlist entries require `user`, `transaction_id`, `added_at` and a bounded integer `slot` (0–19), and a note of
 at most 500 characters).
 
 ```jsonc
@@ -296,7 +302,7 @@ at most 500 characters).
 { "user": "Matthias", "name": "Near my parents", "weights": {...},
   "filters": {...}, "created_at": ISODate }
 
-// shortlists       — unique index {user, transaction_id}, index {user, added_at desc}
+// shortlists       — unique indexes {user, transaction_id} and {user, slot}, index {user, added_at desc}
 { "user": "Matthias", "transaction_id": "TX_...",   // PostgreSQL id, by value
   "block_id": "HDB_...", "note": "Near my parents",
   "snapshot": { "town": "BISHAN", "block_no": "192", "street_name": "BISHAN ST 13",
@@ -382,6 +388,16 @@ validator / survives a data reload / missing sale flag), the index experiments
 failure) and a full GUI walkthrough of both. `tests/test_report.py` checks the
 PDF (content, missing values, the map and its offline fallback) with faked map
 tiles, so no network is needed.
+
+`tests/test_merge_regressions.py` checks simultaneous shortlist saves and
+duplicate requests, migration of existing saved entries, overlapping experiment
+runs and actual PostgreSQL TEMP buffer counters. The shortlist cap is enforced
+by 20 unique per-user slots in MongoDB, without requiring a replica set. Startup
+assigns slots to older saved entries without changing their notes or snapshots.
+If an older buggy client already saved more than 20 entries for one user,
+startup reports the problem and preserves all entries; an administrator must
+back up and resolve those extras before retrying. Stop older app processes
+before upgrading so they do not keep writing the old document format.
 
 ```powershell
 python -m pip install -r requirements-dev.txt

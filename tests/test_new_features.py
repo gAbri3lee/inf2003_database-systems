@@ -188,9 +188,9 @@ def test_validator_and_unique_index_protect_the_collection(repos, prefs):
     with pytest.raises(WriteError):                               # note too long
         prefs.shortlist.insert_one({'user': 'ann', 'transaction_id': 'T1', 'added_at': now,
                                     'note': 'x' * (NOTE_MAX + 1)})
-    prefs.shortlist.insert_one({'user': 'ann', 'transaction_id': 'T1', 'added_at': now})
+    prefs.shortlist.insert_one({'user': 'ann', 'transaction_id': 'T1', 'added_at': now, 'slot': 0})
     with pytest.raises(DuplicateKeyError):
-        prefs.shortlist.insert_one({'user': 'ann', 'transaction_id': 'T1', 'added_at': now})
+        prefs.shortlist.insert_one({'user': 'ann', 'transaction_id': 'T1', 'added_at': now, 'slot': 1})
     assert {'ux_user_txn', 'ix_user_added'} <= set(prefs.shortlist.index_information())
 
 
@@ -428,7 +428,7 @@ def test_gui_shortlist_and_index_experiment_flow(repos, gui_env):
     assert not app.exception and not app.error
     assert mongo.client['hdb_test_ui_shortlist']['shortlists'].count_documents({}) == 0
     log = app.session_state['log']
-    assert {'shortlist: add flat (upsert)', 'shortlist: update note',
+    assert {'shortlist: add flat (bounded insert)', 'shortlist: update note',
             'shortlist: remove flat'} <= {t.label for t in log if t.engine == 'mongodb'}
 
     # index experiment expander on the Benchmark tab
@@ -439,6 +439,59 @@ def test_gui_shortlist_and_index_experiment_flow(repos, gui_env):
     res = app.session_state['ix_result']
     assert res.summary and res.notes                                   # capped to loaded rows
     assert {r['engine'] for r in res.summary} == {'mongodb', 'postgres'}
+    assert app.selectbox(key='ix_chart_size').value == 11  # the vanished sale was deleted above
+    query_choices = app.selectbox(key='ix_chart_query').options
+    app.selectbox(key='ix_chart_query').set_value(query_choices[-1]).run()
+    assert not app.exception and not app.error
     assert [b for b in app.get('download_button')]
     assert mongo.client[experiments.EXPERIMENT_DB].list_collection_names() == []
     mongo.client.drop_database('hdb_test_ui_shortlist')
+
+
+def test_gui_crud_filters_and_benchmark(repos, gui_env):
+    """Exercise GUI form routing as well as the repository-level CRUD tests."""
+    from streamlit.testing.v1 import AppTest
+    pg, mongo = repos
+    app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py'), default_timeout=90).run()
+
+    def widget(kind, label):
+        return next(w for w in getattr(app, kind) if w.label == label)
+
+    def healthy():
+        assert not app.exception and not app.error
+
+    app.radio(key='crud_engine').set_value('Both').run()
+    widget('selectbox', 'Operation').set_value('Create').run()
+    widget('text_input', 'transaction_id').set_value('GUI_MERGE_TEST')
+    widget('text_input', 'block_id (must exist in blocks)').set_value('TEST_BLOCK_0')
+    widget('button', 'Create').click().run()
+    healthy()
+    assert pg.get_transaction('GUI_MERGE_TEST')[0]
+    assert mongo.get_transaction('GUI_MERGE_TEST')[0]
+
+    widget('selectbox', 'Operation').set_value('Read').run()
+    widget('button', 'Read').click().run()
+    healthy()
+    widget('selectbox', 'Operation').set_value('Update').run()
+    widget('text_input', 'New value').set_value('650000')
+    widget('button', 'Update').click().run()
+    healthy()
+    assert float(pg.get_transaction('GUI_MERGE_TEST')[0][0]['resale_price']) == 650000
+    assert mongo.get_transaction('GUI_MERGE_TEST')[0]['resale_price'] == 650000
+    widget('selectbox', 'Operation').set_value('Delete').run()
+    widget('button', 'Delete').click().run()
+    healthy()
+    assert not pg.get_transaction('GUI_MERGE_TEST')[0]
+    assert mongo.get_transaction('GUI_MERGE_TEST')[0] is None
+
+    for engine in ('PostgreSQL', 'MongoDB', 'Both'):
+        app.radio(key='filter_engine').set_value(engine).run()
+        widget('checkbox', 'Show query plan (EXPLAIN / explain())').set_value(True)
+        widget('button', 'Run filter').click().run()
+        healthy()
+    app.selectbox(key='quick_query').set_value('price_extremes').run()
+    assert app.slider(key='q1_area').value == (20, 500)
+    widget('slider', 'Measured repetitions per operation (median shown)').set_value(1)
+    widget('button', 'Run benchmark').click().run()
+    healthy()
+    assert any('All benchmark samples' in e.label for e in app.expander)
