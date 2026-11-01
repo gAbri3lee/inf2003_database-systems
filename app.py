@@ -28,15 +28,18 @@ import altair as alt
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
+from bson.json_util import dumps as bson_dumps
 
 import config
-from src import cleaning, quick, quick_mongo
+from src import cleaning, experiments, quick, quick_mongo, report
+from src.distance import WALK_M_PER_MIN, distance_label, walking_minutes
 from src.loader import run_load
 from src.mutations import coordinated_write
 from src.mongo import MongoRepo
 from src.pg import SCORE_FACTORS, PgRepo
-from src.prefs import PrefsRepo
-from src.timing import Timing
+from src.prefs import NOTE_MAX, SHORTLIST_CAP, PrefsRepo, attach_current
+from src.timing import Timing, stopwatch
+from src.transaction_display import mongo_transaction_row
 
 APP_NAME = "HomeWise SG"
 st.set_page_config(page_title=f"{APP_NAME} · HDB resale explorer",
@@ -257,17 +260,30 @@ def _ff_summary(f: dict) -> str:
 
 def _ff_card(rank: int, r: pd.Series) -> str:
     """HTML for one top-result card (styled by .hw-card in assets/style.css)."""
+    e = html.escape
+    walk_icon = '<i class="hw-walk-icon" role="img" aria-label="Walking"></i>'
+
     def metres(v):
         return "n/a" if pd.isna(v) else f"{v:,.0f} m"
 
+    def amenity_fact(label, value, name=''):
+        content = e(f'{label} {metres(value)}')
+        if name:
+            content += f' · {e(name)}'
+        minutes = walking_minutes(value)
+        tooltip = ''
+        if minutes is not None:
+            content += f' · {walk_icon} ~{minutes} min'
+            tooltip = ' title="Estimated walk at 80 metres/minute using straight-line distance; actual routes may differ."'
+        return f'<span{tooltip}>{content}</span>'
+
     station = (str(r["nearest_mrt"]).title().replace(" Mrt Station", "")
                .replace(" Lrt Station", " LRT") if pd.notna(r.get("nearest_mrt")) else "")
-    facts = [f"MRT {metres(r['distance_to_mrt_m'])}" + (f" · {station}" if station else ""),
-             f"School {metres(r['distance_to_pri_school_m'])}",
-             f"{r['floor_area_sqm']:.0f} sqm"]
+    facts = [amenity_fact('MRT', r['distance_to_mrt_m'], station),
+             amenity_fact('School', r['distance_to_pri_school_m']),
+             f"<span>{r['floor_area_sqm']:.0f} sqm</span>"]
     if pd.notna(r.get("remaining_lease_months")):
-        facts.append(f"{int(r['remaining_lease_months']) // 12} yrs lease")
-    e = html.escape
+        facts.append(f"<span>{int(r['remaining_lease_months']) // 12} yrs lease</span>")
     return (
         '<div class="hw-card">'
         f'<div class="hw-card-top"><span class="hw-rank">#{rank}</span>'
@@ -277,7 +293,7 @@ def _ff_card(rank: int, r: pd.Series) -> str:
         f'<div class="hw-sub">{e(str(r["town"]).title())} · {e(str(r["flat_type"]))} · '
         f'storey {e(str(r["storey_range"]))} · sold {pd.Timestamp(r["month"]):%b %Y}</div>'
         f'<div class="hw-price">${r["resale_price"]:,.0f}</div>'
-        '<div class="hw-facts">' + "".join(f"<span>{e(f)}</span>" for f in facts) + "</div>"
+        '<div class="hw-facts">' + "".join(facts) + "</div>"
         "</div>"
     )
 
@@ -365,6 +381,43 @@ def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
     return (bars + labels).properties(height=46 * data["operation"].nunique() + 20)
 
 
+def _ix_chart(df: pd.DataFrame) -> alt.Chart:
+    """Median latency per mode: one panel per query (rows) and copy size (columns).
+    symlog like _bench_chart, so a 0.5 ms and an 80 ms bar both stay readable."""
+    data = df.assign(
+        mode_label=df["mode"].map({"no index": "no index", "index": "index",
+                                   "index rebuilt": "rebuilt"}),
+        size_label=df["size"].map(lambda n: f"{n:,} sales"))
+    base = alt.Chart(data).encode(
+        x=alt.X("mode_label:N", sort=["no index", "index", "rebuilt"], title=None,
+                axis=alt.Axis(labelAngle=0, labelOverlap=False, labelFontSize=11,
+                              ticks=False, domain=False)),
+        xOffset=alt.XOffset("engine:N", sort=["PostgreSQL", "MongoDB"]),
+        y=alt.Y("median_ms:Q", scale=alt.Scale(type="symlog"), title=None,
+                axis=alt.Axis(values=[0, 1, 10, 100], grid=True, labelFontSize=11)),
+        color=alt.Color("engine:N",
+                        scale=alt.Scale(domain=list(ENGINE_COLORS),
+                                        range=list(ENGINE_COLORS.values())),
+                        legend=alt.Legend(orient="top", title=None, labelFontSize=13)),
+        tooltip=["engine", "query", "mode", alt.Tooltip("median_ms:Q", format=",.2f"),
+                 alt.Tooltip("p95_ms:Q", format=",.2f"), "plan", "examined"],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=3)
+    labels = base.mark_text(dy=-6, fontSize=10, color=LABEL_GREY).encode(
+        text=alt.Text("median_ms:Q", format=",.1f"))
+    return (alt.layer(bars, labels, data=data)
+            .properties(width=230, height=110)
+            .facet(row=alt.Row("query:N", title=None,
+                               header=alt.Header(labelAngle=0, labelAlign="left",
+                                                 labelLimit=300, labelFontSize=13)),
+                   column=alt.Column("size_label:N", title=None,
+                                     sort=sorted(data["size_label"].unique(),
+                                                 key=lambda t: int(t.split()[0].replace(",", ""))),
+                                     header=alt.Header(labelFontSize=13)),
+                   title=alt.TitleParams("median ms per run (log-style scale; bar labels in ms)",
+                                         anchor="start", fontSize=12, color=LABEL_GREY)))
+
+
 def _local_time(t: dt.datetime) -> str:
     """MongoDB hands back naive UTC datetimes; show them in local time."""
     return t.replace(tzinfo=dt.timezone.utc).astimezone().strftime("%d %b %H:%M")
@@ -422,6 +475,7 @@ with st.sidebar:
                 st.session_state.report = rep
                 record(*rep.timings)
                 pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
+                st.session_state.pop('ff_result', None)
                 if rep.rejected_rows:
                     st.warning(f"Excluded {len(rep.rejected_rows)} invalid CSV rows; source unchanged.")
                     st.dataframe(pd.DataFrame(rep.rejected_rows))
@@ -455,6 +509,7 @@ if _stats:
 _first, _, _last = APP_NAME.rpartition(" ")
 st.html(
     '<div class="hw-hero">'
+    '<i class="hw-walk-font-preload" aria-hidden="true">&#xe000;</i>'
     f'<div class="hw-brand">{html.escape(_first)} <span>{html.escape(_last)}</span></div>'
     '<div class="hw-tagline">Find the HDB resale flat that fits your life. Rank real '
     'sales by price, transport, schools, food and green space, and see exactly why '
@@ -474,6 +529,12 @@ st.html(
      ":material/bolt: Quick search", ":material/speed: Benchmark",
      ":material/lightbulb: Notes"]
 )
+
+# Clear results from earlier UI versions before restoring the cloned screen.
+if not st.session_state.get("cloned_find_ui_restored"):
+    for state_key in ("ff_result", "ff_insights_data", "ff_loaded_profile", "ff_pending", "prefs_ready"):
+        st.session_state.pop(state_key, None)
+    st.session_state.cloned_find_ui_restored = True
 
 # -------------------------------------------------------------- Find a flat -- #
 with tab_find:
@@ -532,6 +593,14 @@ with tab_find:
             ss.ff_pending = {"weights": doc.get("weights"), "filters": doc.get("filters")}
             st.rerun()
 
+    # ---- shortlist (MongoDB): which flats this profile already saved ---- #
+    shortlist, saved_ids = [], set()
+    if user:
+        shortlist, _ = prefs.get_shortlist(user)
+        saved_ids = {e["transaction_id"] for e in shortlist}
+    if "ff_flash" in ss:
+        st.toast(ss.pop("ff_flash"))
+
     # ---- filters + priorities ------------------------------------------ #
     left_panel, right_panel = st.columns([5, 6])
     with left_panel.container(border=True, height="stretch"):
@@ -549,7 +618,7 @@ with tab_find:
 
     with right_panel.container(border=True, height="stretch"):
         st.markdown("##### :material/tune: What matters to you?")
-        st.caption("Drag each slider: 0 = don't care, 100 = essential.")
+        st.caption("Drag each slider: 0 = not important, 100 = essential.")
         factor_keys = list(FACTORS)
         for i in range(0, len(factor_keys), 2):
             for col, k in zip(st.columns(2), factor_keys[i:i + 2]):
@@ -661,6 +730,43 @@ with tab_find:
                 ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
                 if ignored:
                     st.caption("Not counted (weight 0): " + ", ".join(ignored))
+                tid = str(r["transaction_id"])
+                # one-page PDF of this flat, built only when the button is clicked
+                pdf_flat = r.to_dict()
+                pdf_parts = [dict(label=FACTORS[k][0], weight=weights[k],
+                                  points=float(r[f"s_{k}"]) * weights[k] / sum(weights.values()),
+                                  text=_ff_explain(k, r).split("**: ", 1)[-1])
+                             for k in active]
+                pdf_note = next((e.get("note", "") for e in shortlist
+                                 if e["transaction_id"] == tid), "")
+                st.download_button(
+                    "Save as PDF", key="ff_pdf", icon=":material/picture_as_pdf:",
+                    data=lambda: report.make_flat_pdf(pdf_flat, pdf_parts, pdf_note),
+                    file_name=report.suggested_filename(pdf_flat), mime="application/pdf",
+                    width="stretch",
+                    help="A printable summary of this flat: details, map, nearby amenities "
+                         "and why it scored the way it did.")
+                if user is None:
+                    st.caption("Pick or create a profile to keep a shortlist of flats.")
+                elif tid in saved_ids:
+                    sb1, sb2 = st.columns(2)
+                    sb1.button("Saved to shortlist", key="ff_shortlist_saved", disabled=True,
+                               icon=":material/bookmark_added:", width="stretch")
+                    if sb2.button("Remove", key="ff_shortlist_rm_sel",
+                                  icon=":material/bookmark_remove:", width="stretch"):
+                        record(prefs.remove_from_shortlist(user, tid))
+                        ss.ff_flash = "Removed from your shortlist"
+                        st.rerun()
+                elif st.button("Add to shortlist", key="ff_shortlist_add",
+                               icon=":material/bookmark_add:", width="stretch"):
+                    status, t = prefs.add_to_shortlist(user, r, r["score"], weights)
+                    record(t)
+                    ss.ff_flash = {
+                        "added": "Added to your shortlist",
+                        "already_saved": "Already on your shortlist",
+                        "full": f"Your shortlist is full ({SHORTLIST_CAP} flats): remove one first",
+                    }[status]
+                    st.rerun()
             with where.container(border=True, height="stretch"):
                 st.markdown("#### :material/map: Where they are")
                 st.pydeck_chart(_ff_map(df, idx), height=520)
@@ -671,6 +777,79 @@ with tab_find:
 
     # ---- saved searches + history (MongoDB) ---------------------------- #
     if user:
+        st.markdown(f"### :material/bookmark: {user}'s shortlist")
+        st.caption(f"Flats you saved, up to {SHORTLIST_CAP}. Stored in MongoDB with a snapshot "
+                   "of the sale, and looked up again in PostgreSQL by transaction id.")
+        if not shortlist:
+            st.info("Nothing saved yet: select a result and click **Add to shortlist**.")
+        else:
+            try:
+                current_rows, _ = pg.get_flats_by_ids([e["transaction_id"] for e in shortlist])
+            except Exception as exc:
+                current_rows = None          # lookup failed: don't claim sales are gone
+                st.warning(f"Could not look up the current sales in PostgreSQL: {exc}")
+            now_res = ss.get("ff_result")
+            now_scores = (dict(zip(now_res["df"]["transaction_id"], now_res["df"]["score"]))
+                          if now_res and not now_res["df"].empty else {})
+            for e in attach_current(shortlist, current_rows or []):
+                tid, snap, cur = e["transaction_id"], e["snapshot"], e["current"]
+                with st.container(border=True):
+                    top_l, top_r = st.columns([4, 2], vertical_alignment="top")
+                    top_l.markdown(
+                        f"**Blk {snap['block_no']} {snap['street_name'].title()}**  \n"
+                        f"{snap['town'].title()} · {snap['flat_type']} · storey "
+                        f"{snap['storey_range']} · {snap['floor_area_sqm']:.0f} sqm")
+                    top_r.markdown(f"**${snap['resale_price']:,.0f}**  \n"
+                                   f":gray[sold {snap['sold_month']:%b %Y}]")
+                    facts = [f"score when saved **{e['score_when_saved']:.0f} / 100**"]
+                    if tid in now_scores:
+                        facts.append(f"now **{now_scores[tid]:.0f} / 100** in these results")
+                    facts.append(f"saved {_local_time(e['added_at'])}")
+                    if cur:
+                        facts.append(f"MRT {distance_label(cur['distance_to_mrt_m'])}")
+                        facts.append(f"school {distance_label(cur['distance_to_pri_school_m'])}")
+                        if cur.get("remaining_lease"):
+                            facts.append(f"lease {cur['remaining_lease']}")
+                    st.caption(" · ".join(facts))
+                    if cur is None and current_rows is not None:
+                        st.warning("No longer in the dataset (it may have been reloaded or "
+                                   "deleted). Showing what was saved.", icon=":material/warning:")
+                    n1, n2, n3 = st.columns([5, 1.2, 1.2], vertical_alignment="bottom")
+                    note = n1.text_input("Note", value=e.get("note", ""), max_chars=NOTE_MAX,
+                                         key=f"ff_sl_note_{tid}", placeholder="Add a note…",
+                                         label_visibility="collapsed")
+                    if n2.button("Save note", key=f"ff_sl_savenote_{tid}", width="stretch",
+                                 disabled=note.strip() == e.get("note", "")):
+                        record(prefs.update_note(user, tid, note))
+                        ss.ff_flash = "Note saved"
+                        st.rerun()
+                    if n3.button("Remove", key=f"ff_sl_rm_{tid}", width="stretch",
+                                 icon=":material/delete:"):
+                        record(prefs.remove_from_shortlist(user, tid))
+                        ss.ff_flash = "Removed from your shortlist"
+                        st.rerun()
+
+            if st.button("Analyse my shortlist", key="ff_sl_insights",
+                         icon=":material/query_stats:"):
+                sl_insights, t = prefs.shortlist_insights(user)
+                record(t)
+                ss.ff_sl_insights_data = (user, sl_insights)
+            if ss.get("ff_sl_insights_data") and ss.ff_sl_insights_data[0] == user:
+                sl_insights = ss.ff_sl_insights_data[1]
+                with st.container(border=True):
+                    j1, j2 = st.columns(2)
+                    for col, key, title in ((j1, "towns", "Towns on your shortlist"),
+                                            (j2, "flat_types", "Flat types on your shortlist")):
+                        sdf = pd.DataFrame(sl_insights[key])
+                        col.markdown(f"**{title}**")
+                        if not sdf.empty:
+                            col.bar_chart(sdf.set_index("_id")["flats"], horizontal=True,
+                                          color=BRAND, x_label="", y_label="flats")
+                    with st.expander("The MongoDB aggregation behind this",
+                                     icon=":material/code:"):
+                        st.code(json.dumps(prefs.shortlist_insights_pipeline(user), indent=2),
+                                language="json")
+
         st.markdown(f"### {user}'s searches")
         h1, h2 = st.columns(2)
         with h1.container(border=True, height="stretch"):
@@ -800,14 +979,22 @@ with tab_crud:
                 if "postgres" in engines:
                     rows, t = pg.get_transaction(tid); record(t); show_timing(t)
                     if rows:
-                        st.dataframe(pd.DataFrame(rows), width="stretch")
+                        st.dataframe(pd.DataFrame(rows), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                    else:
+                        st.info('No transaction found in PostgreSQL for this ID.')
                 if "mongodb" in engines:
                     doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
                     if doc:
-                        st.json(doc, expanded=False)
+                        st.dataframe(pd.DataFrame([mongo_transaction_row(doc)]), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                        with st.expander('MongoDB document'):
+                            st.json(bson_dumps(doc), expanded=False)
+                    else:
+                        st.info('No transaction found in MongoDB for this ID.')
                 if target == "Both":
-                    st.caption("SQL returns a flat row assembled from 8 tables; "
-                               "MongoDB returns the whole nested document in one hit.")
+                    st.caption("Both tables use the same columns. PostgreSQL reads its joined view; "
+                               "MongoDB's embedded fields are flattened for display.")
             except Exception as e:
                 st.error(f"Read failed: {type(e).__name__}: {e}")
 
@@ -854,6 +1041,8 @@ with tab_crud:
                 doc=_mongo_doc_from_input(mongo,data) if 'mongodb' in engines else None
                 for t in coordinated_write(pg,mongo,engines,'create',new_id,data,doc): record(t);show_timing(t)
                 _cached_summary.clear()
+                mongo_distinct.clear()
+                st.session_state.pop('ff_result', None)
                 st.session_state.last_id=new_id
             except Exception as e:
                 st.error(f'Create failed: {type(e).__name__}: {e}')
@@ -876,6 +1065,8 @@ with tab_crud:
                 try:
                     for t in coordinated_write(pg,mongo,engines,'update',tid,{field:val}): record(t);show_timing(t)
                     _cached_summary.clear()
+                    mongo_distinct.clear()
+                    st.session_state.pop('ff_result', None)
                 except Exception as e:
                     st.error(f'Update failed: {type(e).__name__}: {e}')
 
@@ -886,6 +1077,8 @@ with tab_crud:
             try:
                 for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
                 _cached_summary.clear()
+                mongo_distinct.clear()
+                st.session_state.pop('ff_result', None)
             except Exception as e:
                 st.error(f'Delete failed: {type(e).__name__}: {e}')
 
@@ -927,7 +1120,7 @@ with tab_filter:
     sort_by = c9.selectbox("Sort by", ["resale_price", "month", "price_per_sqm",
                                        "floor_area_sqm"])
     sort_desc = c10.checkbox("Descending", value=True)
-    limit = c11.number_input("Limit", min_value=1, max_value=5000, value=200, step=50)
+    limit = c11.number_input("Limit by entries", min_value=1, max_value=5000, value=200, step=50)
 
     params = dict(
         towns=towns, flat_types=flat_types, flat_models=flat_models,
@@ -946,23 +1139,33 @@ with tab_filter:
         cols = st.columns(len(engines))
         for col, eng in zip(cols, engines):
             with col:
-                if eng == "postgres":
-                    rows, t, q = pg.filter(params, int(limit)); record(t)
-                    show_timing(t)
-                    st.code(q, language="sql")
-                    if rows:
-                        st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
-                    if show_plan:
-                        st.text(pg.explain_last())
-                else:
-                    docs, t, q = mongo.filter(params, int(limit)); record(t)
-                    show_timing(t)
-                    st.code(json.dumps(q, default=str, indent=2), language="json")
-                    if docs:
-                        st.dataframe(pd.json_normalize(docs), width="stretch",
-                                     height=360)
-                    if show_plan:
-                        st.json(mongo.explain_last())
+                try:
+                    if eng == "postgres":
+                        rows, t, q = pg.filter(params, int(limit)); record(t)
+                        show_timing(t)
+                        if not rows:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(q, language="sql")
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
+                        if show_plan:
+                            st.text(pg.explain_last())
+                    else:
+                        docs, t, q = mongo.filter(params, int(limit)); record(t)
+                        show_timing(t)
+                        if not docs:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(json.dumps(q, default=str, indent=2), language="json")
+                        if docs:
+                            st.dataframe(pd.json_normalize(docs), width="stretch",
+                                         height=360)
+                        if show_plan:
+                            st.json(mongo.explain_last())
+                except Exception as exc:
+                    name = "PostgreSQL" if eng == "postgres" else "MongoDB"
+                    st.error(f"{name} filter failed: {type(exc).__name__}: {exc}")
         if fe == "Both":
             st.info("Same predicate, two engines. Note the SQL text vs the Mongo "
                     "query document, and compare the millisecond figures above.")
@@ -974,11 +1177,12 @@ QUICK_BANDS = {
     "CBD": [("Under 5 km", 0, 5000), ("5 – 10 km", 5000, 10000),
             ("Over 10 km", 10000, None)],
 }
-_w5, _w10 = 5 * quick.WALK_M_PER_MIN, 10 * quick.WALK_M_PER_MIN
-for _m in ("MRT station", "Bus stop", "Park", "Hawker centre"):
-    QUICK_BANDS[_m] = [(f"Within 5 min walk (< {_w5} m)", 0, _w5),
-                       (f"5 – 10 min walk ({_w5} – {_w10} m)", _w5, _w10),
-                       (f"Over 10 min walk (> {_w10} m)", _w10, None)]
+for _metric in ("MRT station", "Bus stop", "Park", "Hawker centre"):
+    QUICK_BANDS[_metric] = [
+        ("Within 5 min walk (< 400 m)", 0, 400),
+        ("5 – 10 min walk (400 – 800 m)", 400, 800),
+        ("Over 10 min walk (> 800 m)", 800, None),
+    ]
 
 QUICK_LABELS = {
     "price_extremes": "1 · Cheapest / priciest per sqm by town",
@@ -987,7 +1191,7 @@ QUICK_LABELS = {
     "segment_prices": "4 · Min / max price by flat segment (older sales)",
     "recent_prices": "5 · Sales within / older than N years",
     "lease_by_postal": "6 · Shortest remaining lease by postal code",
-    "distance_band": "7 · Distance bands (school, MRT, bus, park, hawker, CBD)",
+    "distance_band": "7 · Nearby amenities (school, MRT, bus, park, hawker, CBD)",
     "flat_age": "8 · Age of flat (filter out old blocks)",
     "floor_premium": "9 · Price step per storey range (nested)",
     "singles": "10 · Singles: MRT & bus distance (view, no 3Gen)",
@@ -1043,7 +1247,57 @@ def _quick_run(qid: str, params: dict, engine_choice: str, limit=None):
             with st.expander("Query"):
                 st.code(q, language="sql" if eng == "postgres" else "json")
             if rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
+                frame = pd.DataFrame(rows)
+                column_config = {}
+                for field, label in {"property_address": "Property Address", "town": "Town",
+                                     "transactions": "Transactions"}.items():
+                    if field in frame:
+                        column_config[field] = st.column_config.Column(label)
+                if "avg_price" in frame:
+                    column_config["avg_price"] = st.column_config.NumberColumn(
+                        "Average price ($)", format="dollar", step=1,
+                        help="Average resale price in Singapore dollars (SGD).")
+                if qid == "mrt_by_town":
+                    for km_column, metre_column, label in [
+                        ("avg_km_to_mrt", "avg_distance_m", "Average Distance"),
+                        ("min_km", "min_distance_m", "Min Distance"),
+                        ("max_km", "max_distance_m", "Max Distance"),
+                    ]:
+                        metres = (frame.pop(metre_column) if metre_column in frame
+                                  else pd.to_numeric(frame[km_column], errors="coerce") * 1000)
+                        frame = frame.rename(columns={km_column: label})
+                        frame[label] = metres.map(distance_label)
+                if qid == "singles":
+                    frame = frame.rename(columns={"nearest_mrt": "Nearest MRT Station"})
+                    for km_column, metre_column, label in [
+                        ("mrt_km", "mrt_distance_m", "Distance to Nearest MRT"),
+                        ("bus_km", "bus_distance_m", "Distance to Nearest Bus Stop"),
+                    ]:
+                        metres = (frame.pop(metre_column) if metre_column in frame
+                                  else pd.to_numeric(frame[km_column], errors="coerce") * 1000)
+                        frame = frame.rename(columns={km_column: label})
+                        frame[label] = metres.map(distance_label)
+                if qid == "distance_band":
+                    # Older query modules may still return only kilometres after
+                    # Streamlit reloads app.py in an existing process.
+                    metres = (frame.pop("distance_m") if "distance_m" in frame
+                              else pd.to_numeric(frame["distance_km"], errors="coerce") * 1000)
+                    frame = frame.rename(columns={"distance_km": "distance"})
+                    frame["distance"] = metres.map(distance_label)
+                    nearest_label = {
+                        "MRT station": "Nearest MRT/LRT", "Primary school": "Nearest School",
+                        "Bus stop": "Nearest Bus Stop", "Park": "Nearest Park",
+                        "Hawker centre": "Nearest Hawker Centre", "CBD": "Nearest CBD",
+                    }[params["metric"]]
+                    column_config["nearest"] = st.column_config.Column(nearest_label)
+                    column_config["distance"] = st.column_config.Column("Distance")
+                    frame["Estimated Travel Time (mins)"] = pd.array(
+                        metres.map(walking_minutes), dtype="Int64")
+                    column_config["Estimated Travel Time (mins)"] = st.column_config.NumberColumn(
+                        "\ue000 Estimated Travel Time (mins)", format="%d", width=290,
+                        help="Estimated walking time at 80 metres/minute, rounded up. "
+                             "Based on straight-line distance; actual routes and travel times may differ.")
+                st.dataframe(frame, width="stretch", height=360, column_config=column_config)
             else:
                 st.info("No rows matched.")
 
@@ -1065,7 +1319,7 @@ with tab_quick:
 
     elif qid == "mrt_by_town":
         st.caption("`AVG(distance_to_mrt)` `GROUP BY town`, one value per block "
-                   "(not per transaction). Distances in km.")
+                   "(not per transaction).")
         p = _quick_filters("q2", types=False, models=False, storey=False)
         if st.button("Run", type="primary", key="run_q2"):
             _quick_run(qid, p, qe)
@@ -1077,7 +1331,7 @@ with tab_quick:
         c1, c2, c3 = st.columns(3)
         p["address_like"] = c1.text_input("Address contains", key="q3_addr") or None
         p["min_count"] = c2.number_input("Min transactions", 1, 1000, 1, key="q3_min")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q3_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q3_lim")
         if st.button("Run", type="primary", key="run_q3"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1089,7 +1343,7 @@ with tab_quick:
         c1, c2 = st.columns(2)
         p["older_than_months"] = c1.number_input("Only sales older than (months)",
                                                  0, 120, 6, key="q4_old")
-        lim = c2.number_input("Limit", 10, 5000, 500, step=50, key="q4_lim")
+        lim = c2.number_input("Limit by entries", 10, 5000, 500, step=50, key="q4_lim")
         if st.button("Run", type="primary", key="run_q4"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1103,7 +1357,7 @@ with tab_quick:
             key="q5_win") == "older than" else "within"
         p["years"] = c2.number_input("Years", 1, 20, 5, key="q5_years")
         p["sort_by"] = c3.selectbox("Sort by", ["month", "resale_price"], key="q5_sort")
-        lim = c4.number_input("Limit", 10, 5000, 200, step=50, key="q5_lim")
+        lim = c4.number_input("Limit by entries", 10, 5000, 200, step=50, key="q5_lim")
         if st.button("Run", type="primary", key="run_q5"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1116,21 +1370,23 @@ with tab_quick:
                                            key="q6_pp") or None
         p["max_lease_years"] = c2.number_input("Only if shortest lease ≤ (years)",
                                                1, 99, 99, key="q6_max")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q6_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q6_lim")
         if st.button("Run", type="primary", key="run_q6"):
             _quick_run(qid, p, qe, int(lim))
 
     elif qid == "distance_band":
-        st.caption(f"Blocks grouped by how far the nearest amenity is. Walking "
-                   f"time assumes ~{quick.WALK_M_PER_MIN} m/min (≈ 4.8 km/h) over "
-                   f"straight-line distance. Actual routes and travel times can differ substantially.")
+        st.caption(f"Find blocks by distance to the nearest amenity. "
+                   f"Estimated walking "
+                   f"time uses {WALK_M_PER_MIN} m/min (4.8 km/h), rounded up to whole minutes, "
+                   f"over straight-line distance. Actual routes and travel times may differ.")
         c1, c2 = st.columns(2)
         metric = c1.selectbox("Nearest…", list(quick.METRICS), key="q7_metric")
         bands = QUICK_BANDS[metric]
-        band = c2.radio("Band", [b[0] for b in bands], key=f"q7_band_{metric}")
-        _, lo, hi = next(b for b in bands if b[0] == band)
+        selected = c2.radio("Distance range", [b[0] for b in bands],
+                            key=f"q7_band_{metric}", label_visibility="collapsed")
+        _, lo, hi = next(b for b in bands if b[0] == selected)
         p = _quick_filters("q7", models=False, storey=False, months=True)
-        lim = st.number_input("Limit", 10, 5000, 200, step=50, key="q7_lim")
+        lim = st.number_input("Limit by entries", 10, 5000, 200, step=50, key="q7_lim")
         p.update(metric=metric, lo_m=lo, hi_m=hi)
         if st.button("Run", type="primary", key="run_q7"):
             _quick_run(qid, p, qe, int(lim))
@@ -1142,14 +1398,15 @@ with tab_quick:
         c1, c2, c3 = st.columns(3)
         p["max_age"] = c1.number_input("Max age (years)", 0, 100, 30, key="q8_max")
         p["min_age"] = c2.number_input("Min age (years)", 0, 100, 0, key="q8_min")
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q8_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q8_lim")
         if st.button("Run", type="primary", key="run_q8"):
             _quick_run(qid, p, qe, int(lim))
 
     elif qid == "floor_premium":
         st.caption("Average price per town for each storey range, and the increase "
-                   "over the range just below it (SQL: `LAG()` over a CTE; Mongo: "
-                   "`$group` then a step computed in Python).")
+                   "over the range just below it (SQL: `LAG()` over a subquery; Mongo: "
+                   "`$group` then `$setWindowFields` with `$shift`, so the step is "
+                   "computed inside the database on both engines).")
         p = _quick_filters("q9", storey=False, area=True, months=True)
         if st.button("Run", type="primary", key="run_q9"):
             _quick_run(qid, p, qe)
@@ -1157,14 +1414,15 @@ with tab_quick:
     elif qid == "singles":
         st.caption("Explore sales excluding 3Gen and Multi-Generation models. "
                    "PostgreSQL uses `v_singles_resale`; MongoDB applies the same "
-                   "exclusion. This model filter is not a buyer-eligibility check. Distances in km.")
+                   "exclusion. This model filter is not a buyer-eligibility check.")
         p = _quick_filters("q10", models=False, storey=False, months=True)
         c1, c2, c3 = st.columns(3)
-        p["max_mrt_km"] = c1.number_input("Max km to MRT (0 = any)", 0.0, 20.0, 0.0,
+        p["max_mrt_km"] = c1.number_input("Maximum distance to MRT (km)", 0.0, 20.0, 0.0,
                                           step=0.1, key="q10_mrt") or None
-        p["max_bus_km"] = c2.number_input("Max km to bus stop (0 = any)", 0.0, 20.0, 0.0,
+        p["max_bus_km"] = c2.number_input("Maximum distance to bus stop (km)", 0.0, 20.0, 0.0,
                                           step=0.1, key="q10_bus") or None
-        lim = c3.number_input("Limit", 10, 5000, 200, step=50, key="q10_lim")
+        lim = c3.number_input("Limit by entries", 10, 5000, 200, step=50, key="q10_lim")
+        st.caption("Enter maximum distances in kilometres (e.g. 0.5 = 500 m). Use 0 for no distance limit.")
         if st.button("Run", type="primary", key="run_q10"):
             _quick_run(qid, p, qe, int(lim))
 
@@ -1208,6 +1466,74 @@ with tab_bench:
         st.dataframe(piv, width="stretch")
         st.caption("Substring and geographic benchmarks return distinct block counts on both engines.")
         st.dataframe(bf, width="stretch", hide_index=True)
+
+    # ---- index experiments (temporary copies only) ---------------------- #
+    st.divider()
+    with st.expander("Index experiments: what an index changes", icon=":material/science:"):
+        st.caption(
+            "Copies the first N sales into a **temporary** MongoDB collection (database "
+            f"`{experiments.EXPERIMENT_DB}`) and a PostgreSQL `TEMP` table, then times each "
+            "query with no index, with the index, and with the index rebuilt. The first run "
+            "of each mode is a warm-up and is left out of the median. Your real collection, "
+            "indexes and tables are never changed, and the copies are removed afterwards.")
+        ix_query_labels = {q.label: k for k, q in experiments.QUERIES.items()}
+        ix_size_labels = {f"{n:,}": n for n in (10_000, 50_000, 100_000)}
+        ix1, ix2, ix3 = st.columns([3, 2, 1])
+        ix_picked_q = ix1.multiselect("Queries", list(ix_query_labels),
+                                      default=list(ix_query_labels), key="ix_queries")
+        ix_picked_n = ix2.multiselect("Copy the first N sales", list(ix_size_labels),
+                                      default=["10,000", "50,000"], key="ix_sizes")
+        ix_repeats = ix3.number_input("Measured runs", 3, 25, 7, key="ix_repeats")
+        if not (pg_ok and mongo_ok):
+            st.warning("Both databases must be online to compare the two engines.")
+        if st.button("Run index experiment", type="primary", key="ix_run",
+                     icon=":material/play_arrow:",
+                     disabled=not (pg_ok and mongo_ok and ix_picked_q and ix_picked_n)):
+            try:
+                with st.spinner("Copying data and timing each mode…"):
+                    with stopwatch("index experiment (temporary copies)",
+                                   "postgres+mongodb") as ix_t:
+                        ix_res = experiments.run_experiments(
+                            mongo, pg, [ix_query_labels[x] for x in ix_picked_q],
+                            [ix_size_labels[x] for x in ix_picked_n], int(ix_repeats))
+                ix_t.rows = len(ix_res.samples)
+                record(ix_t)
+                st.session_state.ix_result = ix_res
+            except Exception as e:
+                st.error(f"Index experiment failed: {type(e).__name__}: {e}")
+
+        ix_res = st.session_state.get("ix_result")
+        if ix_res:
+            for note in ix_res.notes:
+                st.info(note)
+        if ix_res and ix_res.summary:
+            ix_df = pd.DataFrame(ix_res.summary)
+            ix_df["engine"] = ix_df["engine"].map(ENGINE_NAMES)
+            ix_df["query"] = ix_df["query"].map(
+                {k: q.label for k, q in experiments.QUERIES.items()})
+            st.markdown("**Median latency (shorter bar = faster)**")
+            st.altair_chart(_ix_chart(ix_df), width="content")
+            st.markdown("**What each plan did**")
+            st.dataframe(
+                ix_df[["engine", "size", "query", "mode", "median_ms", "p95_ms", "min_ms",
+                       "max_ms", "warmup_ms", "plan", "examined", "keys_examined",
+                       "returned", "engine_ms", "buffers", "index_build_ms"]],
+                hide_index=True, width="stretch",
+                column_config={c: st.column_config.NumberColumn(c, format="%.2f")
+                               for c in ("median_ms", "p95_ms", "min_ms", "max_ms",
+                                         "warmup_ms", "engine_ms", "index_build_ms")})
+            st.caption(
+                "`examined` = documents (MongoDB `totalDocsExamined`) or rows (PostgreSQL) "
+                "read; `keys_examined` is MongoDB index entries; `buffers` is PostgreSQL "
+                "pages touched. `engine_ms` is the engine's own execution time from "
+                "`explain` / `EXPLAIN ANALYZE`; the other ms columns are wall-clock "
+                "including fetching the rows. PostgreSQL may still choose a sequential scan "
+                "when the planner expects that to be cheaper: read the `plan` column.")
+            d1, d2 = st.columns(2)
+            d1.download_button("Download every run (CSV)", experiments.samples_to_csv(ix_res),
+                               "index_experiment_samples.csv", "text/csv", width="stretch")
+            d2.download_button("Download summary (CSV)", experiments.summary_to_csv(ix_res),
+                               "index_experiment_summary.csv", "text/csv", width="stretch")
 
 # -------------------------------------------------------------------- Notes -- #
 with tab_notes:

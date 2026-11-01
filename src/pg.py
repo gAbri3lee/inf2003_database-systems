@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from .mutations import updates
+from .mutations import normalize_create, updates
 
 import pandas as pd
 import psycopg
@@ -365,7 +365,23 @@ class PgRepo:
         t.rows = len(rows)
         return rows, t
 
+    def get_flats_by_ids(self, txn_ids: list[str]):
+        """Current rows for many transaction_ids in one query (the shortlist's
+        by-value references back into PostgreSQL). Missing ids are simply absent."""
+        ids = [str(i) for i in txn_ids]
+        if not ids:
+            return [], Timing(label="shortlist: current rows (0 ids)", engine="postgres", rows=0)
+        with self.conn(autocommit=True) as c, \
+                stopwatch("shortlist: current rows by id (PK + 7 joins)", "postgres") as t:
+            rows = c.execute(
+                "SELECT * FROM v_transactions_full WHERE transaction_id = ANY(%s)",
+                (ids,),
+            ).fetchall()
+        t.rows = len(rows)
+        return rows, t
+
     def create_transaction(self, data: dict):
+        data = normalize_create(data)
         with self.conn() as c, \
                 stopwatch("create (1 row, FK + CHECK enforced)", "postgres") as t:
             model_id = None

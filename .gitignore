@@ -21,6 +21,7 @@ test-results.xml
 
 # Local datasets
 *.csv
+!data/HDB_Compass_trimmed_cleaned.csv
 
 # Editor and OS metadata
 .vscode/

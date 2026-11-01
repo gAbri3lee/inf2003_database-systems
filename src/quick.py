@@ -23,9 +23,8 @@ from psycopg import sql
 from .pg import PgRepo
 from .timing import stopwatch
 from .query_utils import escape_like
+from .distance import WALK_M_PER_MIN
 
-# average adult walking speed ~ 4.8 km/h = 80 m/min (straight-line distance)
-WALK_M_PER_MIN = 80
 MULTIGEN = "(3[ -]?gen|multi[ -]?gen)"
 
 # nearest-amenity columns used by the distance-band query
@@ -159,7 +158,10 @@ SELECT tw.name AS town,
        COUNT(*)                                               AS blocks,
        ROUND((AVG(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS avg_km_to_mrt,
        ROUND((MIN(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS min_km,
-       ROUND((MAX(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS max_km
+       ROUND((MAX(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS max_km,
+       AVG(b.distance_to_mrt_m)                            AS avg_distance_m,
+       MIN(b.distance_to_mrt_m)                            AS min_distance_m,
+       MAX(b.distance_to_mrt_m)                            AS max_distance_m
 FROM blocks b
 JOIN towns tw ON tw.town_id = b.town_id
 {where(conds)}
@@ -250,6 +252,7 @@ def distance_band(repo, p, limit=200):
 SELECT b.property_address, tw.name AS town,
        {mt['name']}                                       AS nearest,
        ROUND((MIN({mt['dist']}) / 1000.0)::numeric, 2)    AS distance_km,
+       MIN({mt['dist']})                                  AS distance_m,
        COUNT(*)                                           AS transactions,
        ROUND(AVG(t.resale_price), 0)                      AS avg_price
 {FROM_TXN}
@@ -348,6 +351,8 @@ def singles(repo, p, limit=200):
 SELECT property_address, town, nearest_mrt,
        MIN(mrt_km)                 AS mrt_km,
        MIN(bus_km)                 AS bus_km,
+       MIN(mrt_distance_m)         AS mrt_distance_m,
+       MIN(bus_distance_m)         AS bus_distance_m,
        COUNT(*)                    AS transactions,
        ROUND(AVG(resale_price), 0) AS avg_price
 FROM v_singles_resale

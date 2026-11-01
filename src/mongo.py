@@ -22,7 +22,7 @@ from pymongo.errors import OperationFailure
 
 from .timing import stopwatch, Timing, benchmark_timing
 from .query_utils import EARTH_RADIUS_M
-from .mutations import updates
+from .mutations import normalize_create, updates
 
 VALIDATOR = {
     "$jsonSchema": {
@@ -153,6 +153,7 @@ class MongoRepo:
         return doc, t
 
     def create_transaction(self, doc: dict):
+        doc = normalize_create(doc)
         with stopwatch("create (1 doc, $jsonSchema validated)", "mongodb") as t:
             self.coll.insert_one(doc)
         return t
