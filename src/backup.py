@@ -41,7 +41,7 @@ from bson.raw_bson import RawBSONDocument
 from psycopg import IsolationLevel, sql
 from pymongo import MongoClient
 
-from .pg import GRANTS_SQL, LOAD_ORDER, SCHEMA_SQL, PgRepo
+from .pg import GRANTS_SQL, LOAD_ORDER, RESET_IDENTITY_SQL, SCHEMA_SQL, PgRepo
 from .quick import SINGLES_VIEW_SQL
 from .timing import Timing, stopwatch
 
@@ -93,6 +93,12 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _is_scratch(collection: str) -> bool:
+    """System collections, a restore's staging copy, and a CSV load's stage/backup."""
+    return (collection.startswith("system.") or collection.endswith("__restore")
+            or "_stage_" in collection or "_backup_" in collection)
+
+
 def _count_bson(buf: bytes) -> int:
     """Documents in a buffer of concatenated BSON (each starts with its int32 size)."""
     n = pos = 0
@@ -113,7 +119,7 @@ def create_backup(pg: PgRepo | None, mongo: MongoClient | None, mongo_dbs: list[
         final = root / f"{stamp}_{i}"; i += 1
     tmp = root / f"{final.name}.partial"
     shutil.rmtree(tmp, ignore_errors=True)
-    manifest = {"format": FORMAT, "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+    manifest = {"format": FORMAT, "created_at": dt.datetime.now().isoformat(timespec="milliseconds"),
                 "label": label, "postgres": {}, "mongodb": {}}
     timings: list[Timing] = []
 
@@ -162,8 +168,7 @@ def _backup_mongo(client: MongoClient, dbs: list[str], out: Path, manifest: dict
     timings = []
     for db_name in dbs:
         db = client[db_name]
-        names = sorted(n for n in db.list_collection_names()
-                       if not n.startswith("system.") and not n.endswith("__restore"))
+        names = sorted(n for n in db.list_collection_names() if not _is_scratch(n))
         if not names:
             continue
         (out / "mongodb" / db_name).mkdir(parents=True, exist_ok=True)
@@ -265,6 +270,7 @@ def _restore_pg(b: Backup, pg: PgRepo) -> list[Timing]:
             if t.rows != e["rows"]:
                 raise BackupError(f"{name}: restored {t.rows} rows, backup has {e['rows']}")
             timings.append(t)
+        c.execute(RESET_IDENTITY_SQL)
         c.execute(SINGLES_VIEW_SQL)
         c.execute(GRANTS_SQL)
         c.commit()

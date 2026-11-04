@@ -16,7 +16,7 @@ YES, NO, NA = "✅ Allowed", "⛔ Denied", "—"
 def switcher() -> tuple[Role, st.delta_generator.DeltaGenerator]:
     """Render the switch top right; returns the role and an empty popover that
     :func:`access_panel` fills once the role's connections exist."""
-    st.session_state.setdefault("role", "guest")
+    st.session_state.setdefault("role", config.DEFAULT_ROLE)
     # a right-aligned row sized to its contents, so nothing gets squeezed
     with st.container(horizontal=True, horizontal_alignment="right",
                       vertical_alignment="bottom"):
@@ -26,7 +26,10 @@ def switcher() -> tuple[Role, st.delta_generator.DeltaGenerator]:
             help="There is no login screen in this prototype: pick who you are. Each "
                  "role connects with its own database logins, which only hold the "
                  "rights that role needs.")
-        pop = st.popover("Access", icon=":material/shield_person:", width="content")
+        # on_change="rerun" makes pop.open usable: the panel queries both databases,
+        # so it should only do that while someone is looking at it
+        pop = st.popover("Access", icon=":material/shield_person:", width="content",
+                         key="access_panel", on_change="rerun")
     return ROLES[key], pop
 
 
@@ -82,6 +85,8 @@ def enforcement_note():
 
 
 def access_panel(pop, ctx: resources.Ctx):
+    if not pop.open:
+        return
     with pop:
         role = ctx.role
         st.markdown(f"#### {role.icon} {role.label}")

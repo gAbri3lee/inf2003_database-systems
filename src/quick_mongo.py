@@ -5,7 +5,7 @@ Same signature and same output columns as the PostgreSQL versions::
     rows, timing, pipeline_text = QUERIES[qid](mongo_repo, params, limit)
 
 There are no views or nested SQL here: aggregates are ``$group`` stages, the
-"nested" floor-premium step is computed after the ``$group`` in Python, and the
+"nested" floor-premium step is a ``$setWindowFields`` stage, and the
 singles "view" is just a ``$match`` that excludes Multi-Generation flats.
 """
 from __future__ import annotations
@@ -62,7 +62,25 @@ def _limit(limit) -> list:
     return [{"$limit": int(limit)}] if limit else []
 
 
+def _sql_rounds(value):
+    """Use PostgreSQL numeric rounding (ties away from zero), not Mongo ties-to-even."""
+    if isinstance(value, list):
+        return [_sql_rounds(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value)=={'$round'}:
+        expr,places=value['$round']
+        scale=10**places
+        scaled={'$multiply':[{'$toDecimal':_sql_rounds(expr)},scale]}
+        rounded={'$cond':[{'$gte':[scaled,0]},
+            {'$floor':{'$add':[scaled,0.5]}},
+            {'$ceil':{'$subtract':[scaled,0.5]}}]}
+        return {'$toDouble':{'$divide':[rounded,scale]}}
+    return {k:_sql_rounds(v) for k,v in value.items()}
+
+
 def _run(repo: MongoRepo, label: str, pipeline: list, post=None):
+    pipeline=_sql_rounds(pipeline)
     with stopwatch(label, "mongodb") as t:
         rows = list(repo.coll.aggregate(pipeline, allowDiskUse=True))
         if post:
@@ -82,7 +100,7 @@ def price_extremes(repo, p, limit=None):
         {"$project": {"_id": 0, "town": "$_id", "transactions": "$n",
                       "min_price_per_sqm": "$lo", "max_price_per_sqm": "$hi",
                       "avg_price_per_sqm": {"$round": ["$avg", 0]}}},
-        {"$sort": {"max_price_per_sqm": -1}}, *_limit(limit),
+        {"$sort": {"max_price_per_sqm": -1, "town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: price/sqm extremes by town", pipe)
 
@@ -101,8 +119,9 @@ def mrt_by_town(repo, p, limit=None):
         {"$project": {"_id": 0, "town": "$_id", "blocks": "$n",
                       "avg_km_to_mrt": {"$round": [{"$divide": ["$avg", 1000]}, 2]},
                       "min_km": {"$round": [{"$divide": ["$lo", 1000]}, 2]},
-                      "max_km": {"$round": [{"$divide": ["$hi", 1000]}, 2]}}},
-        {"$sort": {"avg_km_to_mrt": 1}}, *_limit(limit),
+                      "max_km": {"$round": [{"$divide": ["$hi", 1000]}, 2]},
+                      "avg_distance_m": "$avg", "min_distance_m": "$lo", "max_distance_m": "$hi"}},
+        {"$sort": {"avg_km_to_mrt": 1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: avg MRT distance by town", pipe)
 
@@ -120,7 +139,7 @@ def txn_count(repo, p, limit=200):
         {"$match": {"n": {"$gte": int(p.get("min_count") or 1)}}},
         {"$project": {"_id": 0, "property_address": "$_id.a", "town": "$_id.t",
                       "transactions": "$n", "first_sale": "$first", "last_sale": "$last"}},
-        {"$sort": {"transactions": -1}}, *_limit(limit),
+        {"$sort": {"transactions": -1,"property_address":1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: transactions per address", pipe)
 
@@ -144,7 +163,7 @@ def recent_prices(repo, p, limit=200):
     sort = {"month": "month", "resale_price": "resale_price"}.get(p.get("sort_by"), "month")
     pipe = [
         {"$match": _match(window_params(p))},
-        {"$sort": {sort: -1}}, *_limit(limit),
+        {"$sort": {sort: -1,"_id":1}}, *_limit(limit),
         {"$project": {"_id": 0, "month": 1, "town": "$block.town",
                       "property_address": "$block.property_address",
                       "flat_type": 1, "flat_model": 1, "storey_range": 1,
@@ -190,6 +209,7 @@ def distance_band(repo, p, limit=200):
                     "n": {"$sum": 1}, "avg": {"$avg": "$resale_price"}}},
         {"$project": {"_id": 0, "property_address": "$addr", "town": 1, "nearest": "$near",
                       "distance_km": {"$round": [{"$divide": ["$d", 1000]}, 2]},
+                      "distance_m": "$d",
                       "transactions": "$n", "avg_price": {"$round": ["$avg", 0]}}},
         {"$sort": {"distance_km": 1, "property_address": 1}}, *_limit(limit),
     ]
@@ -216,27 +236,37 @@ def flat_age(repo, p, limit=200):
 
 
 def floor_premium(repo, p, limit=None):
+    """9. Average price per storey range and the step up from the range below.
+
+    Runs entirely inside MongoDB: ``$setWindowFields`` with ``$shift`` is the
+    pipeline twin of SQL's ``LAG() OVER (PARTITION BY town ORDER BY lowest_floor)``.
+    ``$round`` here is rewritten by :func:`_run` to PostgreSQL's rounding."""
     m = _match(p)
     m["storey_range"] = {**m.get("storey_range", {}), "$ne": None}
-
-    def post(rows):
-        rows.sort(key=lambda r: (r["town"], int(r["storey_range"].split()[0])))
-        prev_town, prev = None, None
-        for r in rows:
-            r["increase_vs_prev_range"] = (
-                round(r["avg_price"] - prev) if r["town"] == prev_town else None)
-            prev_town, prev = r["town"], r["avg_price"]
-            r["avg_price"] = round(r["avg_price"])
-        return rows[:int(limit)] if limit else rows
-
+    order = {"lowest_floor": 1, "storey_range": 1}
     pipe = [
         {"$match": m},
         {"$group": {"_id": {"t": "$block.town", "s": "$storey_range"},
                     "n": {"$sum": 1}, "avg": {"$avg": "$resale_price"}}},
         {"$project": {"_id": 0, "town": "$_id.t", "storey_range": "$_id.s",
-                      "transactions": "$n", "avg_price": "$avg"}},
+                      "transactions": "$n", "avg": "$avg",
+                      # "10 TO 12" -> 10, as SPLIT_PART(...) does in SQL
+                      "lowest_floor": {"$toInt": {"$arrayElemAt": [
+                          {"$split": ["$_id.s", " "]}, 0]}}}},
+        {"$setWindowFields": {
+            "partitionBy": "$town", "sortBy": order,
+            "output": {"prev_avg": {"$shift": {"output": "$avg", "by": -1}}}}},
+        {"$project": {
+            "town": 1, "storey_range": 1, "transactions": 1, "lowest_floor": 1,
+            "avg_price": {"$round": ["$avg", 0]},
+            "increase_vs_prev_range": {"$cond": [
+                {"$eq": [{"$ifNull": ["$prev_avg", None]}, None]}, None,
+                {"$round": [{"$subtract": ["$avg", "$prev_avg"]}, 0]}]}}},
+        {"$sort": {"town": 1, **order}},
+        *_limit(limit),
+        {"$project": {"lowest_floor": 0}},
     ]
-    return _run(repo, "quick: avg price step per storey range", pipe, post)
+    return _run(repo, "quick: avg price step per storey range", pipe)
 
 
 def singles(repo, p, limit=200):
@@ -258,8 +288,9 @@ def singles(repo, p, limit=200):
         {"$project": {"_id": 0, "property_address": "$addr", "town": 1, "nearest_mrt": "$mrt",
                       "mrt_km": {"$round": [{"$divide": ["$mrt_d", 1000]}, 2]},
                       "bus_km": {"$round": [{"$divide": ["$bus_d", 1000]}, 2]},
+                      "mrt_distance_m": "$mrt_d", "bus_distance_m": "$bus_d",
                       "transactions": "$n", "avg_price": {"$round": ["$avg", 0]}}},
-        {"$sort": {"mrt_km": 1, "bus_km": 1}}, *_limit(limit),
+        {"$sort": {"mrt_km": 1, "bus_km": 1,"property_address":1,"town":1}}, *_limit(limit),
     ]
     return _run(repo, "quick: singles (no 3Gen)", pipe)
 

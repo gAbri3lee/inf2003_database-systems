@@ -1,0 +1,41 @@
+name: Application integration tests
+on:
+  push:
+    branches: [main, gerome, Matthias, 'integrate-*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    # MongoDB 8 cannot start on affected 6.19+ kernels; use the supported 6.8 runner.
+    # https://www.mongodb.com/community/forums/t/mongodb-8-x-and-linux-kernel-6-19/337547
+    runs-on: ubuntu-22.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: hdb_test
+          POSTGRES_PASSWORD: test_only
+          POSTGRES_DB: hdb_test_merge
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U hdb_test -d hdb_test_merge"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mongo:
+        image: mongo:8.0
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_PG_DSN: host=127.0.0.1 port=5432 user=hdb_test password=test_only dbname=hdb_test_merge
+      TEST_MONGO_URI: mongodb://127.0.0.1:27017/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q --junitxml=test-results.xml

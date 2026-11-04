@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -127,13 +128,15 @@ _LEASE_RE = re.compile(r"(?:(\d+)\s*years?)?\s*(?:(\d+)\s*months?)?", re.I)
 def _lease_to_months(text) -> int | None:
     if not isinstance(text, str):
         return None
-    m = _LEASE_RE.search(text.strip())
+    m = _LEASE_RE.fullmatch(text.strip())
     if not m:
         return None
     years = int(m.group(1)) if m.group(1) else 0
     months = int(m.group(2)) if m.group(2) else 0
+    if not (m.group(1) or m.group(2)) or months>11:
+        return None
     total = years * 12 + months
-    return total or None
+    return total if total<=99*12 else None
 
 
 def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFrame:
@@ -164,7 +167,7 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
     # Strip before deriving IDs so a stray trailing space can't split one
     # block (or hawker/park) into two surrogate IDs.
     for col in df.columns:
-        if df[col].dtype == object:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
             df[col] = df[col].str.strip()
 
     # The CSV stores postal codes as floats ("570192.0"), which also drops the
@@ -172,6 +175,16 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
     df["postal_code"] = (
         df["postal_code"].str.replace(r"\.0$", "", regex=True).str.zfill(6)
     )
+    # Optional, source-attributed OneMap lookup restores coordinates omitted by trimming.
+    # Require both an exact address and the same postal code; never guess a point.
+    lookup_path=Path(__file__).resolve().parents[1]/'data/block_coordinates.json'
+    if lookup_path.exists():
+        lookup=json.loads(lookup_path.read_text(encoding='utf-8'))['blocks']
+        keys=df.block_no.fillna('').str.upper()+'|'+df.street_name.fillna('').str.upper()
+        points=[lookup.get(k,{}) for k in keys]
+        for coordinate in ['latitude','longitude']:
+            values=[p.get(coordinate) if p.get('postal_code')==postal else None for p,postal in zip(points,df.postal_code)]
+            df[coordinate]=df[coordinate].where(df[coordinate].notna(),pd.Series(values,index=df.index))
 
     if df["property_address"].isna().all():
         df["property_address"] = (
@@ -224,12 +237,15 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
 
     for col in FLOAT_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in FLOAT_COLS+MONEY_COLS:
+        if df[col].dropna().map(lambda v:not math.isfinite(float(v))).any():
+            raise ValueError(f'Non-finite numeric value: {col}')
 
     for col in COUNT_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
     # month "2024-07" -> first-of-month timestamp
-    df["month"] = pd.to_datetime(df["month"] + "-01", errors="coerce")
+    df["month"] = pd.to_datetime(df["month"] + "-01",format='%Y-%m-%d', errors="coerce")
 
     df["remaining_lease_months"] = df["remaining_lease"].map(_lease_to_months).astype("Int64")
 
@@ -249,8 +265,21 @@ def load_dataframe(csv_path: str | Path, limit: int | None = None) -> pd.DataFra
     # a handful of rows have no usable price / area - drop them so the
     # relational CHECK constraints (resale_price > 0, floor_area_sqm > 0) hold.
     before = len(df)
+    rejected=[{"csv_row":int(i)+2,"reason":"Missing/non-positive resale price or floor area"} for i in df.index[~((df.resale_price>0)&(df.floor_area_sqm>0))]]
     df = df[(df["resale_price"] > 0) & (df["floor_area_sqm"] > 0)].copy()
     df.attrs["dropped_invalid"] = before - len(df)
+    df.attrs["rejected_rows"] = rejected
+    for col in ['transaction_id','block_id','town','block_no','street_name','flat_type','month']:
+        if df[col].isna().any() or df[col].astype(str).str.strip().eq('').any():
+            raise ValueError(f'Missing or invalid required field: {col}')
+    if df.transaction_id.duplicated().any():
+        raise ValueError('Duplicate transaction identifiers')
+    if (df.remaining_lease.notna() & df.remaining_lease_months.isna()).any():
+        raise ValueError('Invalid remaining lease; expected valid years and 0..11 months')
+    for col in ['distance_to_mrt_m','bus_distance_m','hawker_distance_m','park_distance_m','distance_to_cbd_m','distance_to_pri_school_m']:
+        if df[col].lt(0).any(): raise ValueError(f'Negative distance: {col}')
+    for col,lo,hi in [('latitude',-90,90),('longitude',-180,180)]:
+        if (df[col].notna() & ~df[col].between(lo,hi)).any(): raise ValueError(f'Invalid {col}')
     return df
 
 
@@ -324,6 +353,10 @@ def build_relational(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     school_id = dict(zip(schools["name"], schools["school_id"]))
 
     # one row per physical block
+    block_fields=['town','block_no','street_name','postal_code','max_floor_lvl','year_completed','commercial','mrt_station','distance_to_mrt_m','bus_distance_m','hawker_name','hawker_distance_m','park_name','park_distance_m','pri_school','distance_to_pri_school_m','distance_to_cbd_m']
+    conflicts=df.groupby('block_id')[block_fields].nunique(dropna=False).gt(1)
+    if conflicts.any().any():
+        raise ValueError('Conflicting block attributes: '+', '.join(conflicts.columns[conflicts.any()]))
     blk = df.sort_values("month").groupby("block_id", as_index=False).first()
     blocks = pd.DataFrame({
         "block_id": blk["block_id"],
@@ -383,7 +416,7 @@ def build_relational(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 # --------------------------------------------------------------------------- #
 def _clean(v):
     """Make a value BSON/JSON safe (NaN/NaT/pd.NA -> None, numpy -> python)."""
-    if v is None or v is pd.NA:
+    if v is None or v is pd.NA or v is pd.NaT:
         return None
     if isinstance(v, float) and math.isnan(v):
         return None

@@ -35,14 +35,13 @@ def render(ctx: Ctx):
   (`ForeignKeyViolation`, `CheckViolation`).
 * **Normalization removes redundancy & update anomalies.** A town or flat-model
   name is stored once. `blocks` holds ~10k rows; MongoDB repeats the block
-  sub-document in all ~172k transactions (`collstats` logical size ≈ 260 MB vs
-  the whole PostgreSQL database ≈ 147 MB). Smaller tables also make the geo and
-  substring scans *faster* here, not slower.
+  sub-document in all ~172k transactions (inspect storage statistics for the loaded dataset). Latency depends on
+  indexes, data size and execution plans.
 * **Mature planner + `EXPLAIN`.** Turn on "Show query plan" in the Filter tab.
-  Hash aggregates over the narrow `transactions` table beat scanning fat
-  documents for the group-by-town / monthly-trend queries.
+  Inspect aggregates over `transactions` and MongoDB documents to explain
+  observed group-by-town / monthly-trend timings.
 * **Transactions.** The benchmark's bulk update runs in a transaction and is
-  rolled back — the DB is byte-for-byte unchanged. A standalone MongoDB has no
+  rolled back — the committed logical values are unchanged; physical files and WAL can change. A standalone MongoDB has no
   multi-document rollback.
 * **Ad-hoc joins.** `v_transactions_full` joins 8 tables with no schema change.
 
@@ -68,6 +67,25 @@ def render(ctx: Ctx):
   integrity; unanchored `$regex` and some `$group`s scan the whole collection;
   no cross-document rollback on a standalone `mongod`.
 
+### Price check: how "similar sales" are chosen
+* **Comparable sales:** same town and flat type, floor area within ±10 sqm, sold in
+  the last N months ending at the newest month in the data, excluding the flat
+  itself. Compared on **price per sqm** so size does not distort the result.
+* **At least 10 sales or no percentile.** Otherwise the group is widened in steps
+  (drop the storey filter, ±20 sqm, 24 months) and the step used is shown; if it is
+  still under 10 the app says so rather than inventing a number.
+* **Percentile rank** = (cheaper + 0.5 × equal) ÷ comparables × 100, identical on both
+  engines because they only count. Tags: ≤ 25 *Lower than most*, ≥ 75 *Higher than
+  most*, otherwise *Typical*. Median and quartiles are informational:
+  PostgreSQL interpolates (`percentile_cont`), MongoDB's `$percentile` / `$median` are
+  `approximate`.
+* **MongoDB features used:** `$match` on the compound index
+  `{block.town, flat_type, month, price_per_sqm}`, then one `$facet` (a `$group` of
+  statistics plus two counts) in a single pass. PostgreSQL uses a CTE with
+  `percentile_cont` and `COUNT(*) FILTER`.
+* **Limits:** price per sqm only: remaining lease, renovation, view and exact location
+  are not considered, and older sales are compared with the most recent ones.
+
 ### Try this in a demo
 1. **CRUD → Read → Both** on one id — compare ms *and* the flat row vs the
    nested document.
@@ -75,10 +93,11 @@ def render(ctx: Ctx):
    MongoDB (validator off) would accept the orphan.
 3. **Filter → Both** with the geo radius on — read the generated SQL vs the
    Mongo query document.
-4. **Benchmark** — point lookup & the pre-indexed top-20 favour MongoDB;
-   grouped aggregates, substring search and the transactional bulk update favour
-   PostgreSQL. The lesson is *"it depends on the access pattern"*, which is the
-   point of the comparison.
+4. **Benchmark** — measure each workload and inspect query plans. Explain observed
+   results rather than assuming a winning engine. Bulk updates use different
+   rollback strategies and are not identical write workloads.
+5. **Find a flat → Price check → Both** — same percentile and tag from a CTE
+   (`percentile_cont`) and a `$facet` pipeline; open *Show the query* for each.
         """
     )
 

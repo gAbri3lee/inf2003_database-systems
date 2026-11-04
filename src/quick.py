@@ -22,10 +22,10 @@ from psycopg import sql
 
 from .pg import PgRepo
 from .timing import stopwatch
+from .query_utils import escape_like
+from .distance import WALK_M_PER_MIN
 
-# average adult walking speed ~ 4.8 km/h = 80 m/min (straight-line distance)
-WALK_M_PER_MIN = 80
-MULTIGEN = "multi.?gen"          # HDB: every flat model except 3Gen may be resold to singles
+MULTIGEN = "(3[ -]?gen|multi[ -]?gen)"
 
 # nearest-amenity columns used by the distance-band query
 METRICS = {
@@ -125,7 +125,7 @@ def limit_clause(limit) -> str:
 
 
 def _run(repo: PgRepo, label: str, query: str):
-    with stopwatch(label, "postgres") as t, repo.conn(autocommit=True) as c:
+    with repo.conn(autocommit=True) as c, stopwatch(label, "postgres") as t:
         rows = c.execute(query).fetchall()
     t.rows = len(rows)
     return [plain_row(r) for r in rows], t, query
@@ -143,7 +143,7 @@ SELECT tw.name AS town,
 {FROM_TXN}
 {where(txn_conditions(p))}
 GROUP BY tw.name
-ORDER BY max_price_per_sqm DESC
+ORDER BY max_price_per_sqm DESC, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: price/sqm extremes by town", q)
 
@@ -158,12 +158,15 @@ SELECT tw.name AS town,
        COUNT(*)                                               AS blocks,
        ROUND((AVG(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS avg_km_to_mrt,
        ROUND((MIN(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS min_km,
-       ROUND((MAX(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS max_km
+       ROUND((MAX(b.distance_to_mrt_m) / 1000.0)::numeric, 2) AS max_km,
+       AVG(b.distance_to_mrt_m)                            AS avg_distance_m,
+       MIN(b.distance_to_mrt_m)                            AS min_distance_m,
+       MAX(b.distance_to_mrt_m)                            AS max_distance_m
 FROM blocks b
 JOIN towns tw ON tw.town_id = b.town_id
 {where(conds)}
 GROUP BY tw.name
-ORDER BY avg_km_to_mrt
+ORDER BY avg_km_to_mrt, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: avg MRT distance by town", q)
 
@@ -172,7 +175,7 @@ def txn_count(repo, p, limit=200):
     """3. How many transactions per address."""
     conds = txn_conditions(p)
     if p.get("address_like"):
-        conds.append(f"b.property_address ILIKE {lit('%' + p['address_like'] + '%')}")
+        conds.append(f"b.property_address ILIKE {lit('%' + escape_like(p['address_like']) + '%')}")
     q = f"""
 SELECT b.property_address, tw.name AS town,
        COUNT(*)     AS transactions,
@@ -182,7 +185,7 @@ SELECT b.property_address, tw.name AS town,
 {where(conds)}
 GROUP BY b.property_address, tw.name
 HAVING COUNT(*) >= {int(p.get('min_count') or 1)}
-ORDER BY transactions DESC
+ORDER BY transactions DESC, property_address, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: transactions per address", q)
 
@@ -213,7 +216,7 @@ SELECT t.month, tw.name AS town, b.property_address,
        t.floor_area_sqm, t.remaining_lease, t.resale_price
 {FROM_TXN}
 {where(txn_conditions(window_params(p)))}
-ORDER BY {sort} DESC
+ORDER BY {sort} DESC, t.transaction_id
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: sales within/older than N years", q)
 
@@ -223,7 +226,7 @@ def lease_by_postal(repo, p, limit=200):
     conds = ["b.postal_code IS NOT NULL", "t.remaining_lease_months IS NOT NULL",
              *txn_conditions(p)]
     if p.get("postal_prefix"):
-        conds.append(f"b.postal_code LIKE {lit(p['postal_prefix'] + '%')}")
+        conds.append(f"b.postal_code LIKE {lit(escape_like(p['postal_prefix']) + '%')}")
     q = f"""
 SELECT b.postal_code,
        MIN(tw.name)                  AS town,
@@ -249,6 +252,7 @@ def distance_band(repo, p, limit=200):
 SELECT b.property_address, tw.name AS town,
        {mt['name']}                                       AS nearest,
        ROUND((MIN({mt['dist']}) / 1000.0)::numeric, 2)    AS distance_km,
+       MIN({mt['dist']})                                  AS distance_m,
        COUNT(*)                                           AS transactions,
        ROUND(AVG(t.resale_price), 0)                      AS avg_price
 {FROM_TXN}
@@ -299,7 +303,7 @@ FROM (
     {where(conds).replace(chr(10), chr(10) + '    ')}
     GROUP BY tw.name, t.storey_range
 ) AS per_range
-ORDER BY town, lowest_floor
+ORDER BY town, lowest_floor, storey_range
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: avg price step per storey range (nested)", q)
 
@@ -315,7 +319,9 @@ SELECT t.transaction_id, t.month, tw.name AS town, b.block_id,
        t.remaining_lease_months,
        s.name AS nearest_mrt,
        ROUND((b.distance_to_mrt_m / 1000.0)::numeric, 2) AS mrt_km,
-       ROUND((b.bus_distance_m    / 1000.0)::numeric, 2) AS bus_km
+       ROUND((b.bus_distance_m    / 1000.0)::numeric, 2) AS bus_km,
+       b.distance_to_mrt_m AS mrt_distance_m,
+       b.bus_distance_m
 FROM   transactions t
 JOIN   blocks b            ON b.block_id    = t.block_id
 JOIN   towns  tw           ON tw.town_id    = b.town_id
@@ -341,19 +347,21 @@ def singles(repo, p, limit=200):
     if p.get("month_to"):
         conds.append(f"month <= {lit(p['month_to'])}")
     if p.get("max_mrt_km") is not None:
-        conds.append(f"mrt_km <= {lit(p['max_mrt_km'])}")
+        conds.append(f"mrt_distance_m <= {lit(p['max_mrt_km'] * 1000)}")
     if p.get("max_bus_km") is not None:
-        conds.append(f"bus_km <= {lit(p['max_bus_km'])}")
+        conds.append(f"bus_distance_m <= {lit(p['max_bus_km'] * 1000)}")
     q = f"""
 SELECT property_address, town, nearest_mrt,
        MIN(mrt_km)                 AS mrt_km,
        MIN(bus_km)                 AS bus_km,
+       MIN(mrt_distance_m)         AS mrt_distance_m,
+       MIN(bus_distance_m)         AS bus_distance_m,
        COUNT(*)                    AS transactions,
        ROUND(AVG(resale_price), 0) AS avg_price
 FROM v_singles_resale
 {where(conds)}
 GROUP BY block_id, property_address, town, nearest_mrt
-ORDER BY mrt_km, bus_km
+ORDER BY mrt_km, bus_km, property_address, town
 {limit_clause(limit)}""".strip()
     return _run(repo, "quick: singles (v_singles_resale view)", q)
 

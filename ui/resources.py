@@ -7,6 +7,7 @@ repos, so even the caches never hold more access than they need.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import streamlit as st
@@ -65,6 +66,9 @@ def _provision_mongo() -> None:
 def provision() -> dict[str, str]:
     """Create the role logins; returns {engine: error} for whatever failed."""
     errors = {}
+    # read per call: tests with fake repos must not reach a real server
+    if os.environ.get("HDB_PROVISION_ROLES", "1") == "0":
+        return errors
     for engine, fn in (("PostgreSQL", _provision_pg), ("MongoDB", _provision_mongo)):
         try:
             fn()

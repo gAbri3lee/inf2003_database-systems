@@ -29,7 +29,7 @@ def render(ctx: Ctx):
     c4, c5 = st.columns(2)
     price = c4.slider("Resale price (SGD)", 100_000, 1_800_000,
                       (300_000, 800_000), step=10_000)
-    area = c5.slider("Floor area (sqm)", 20, 300, (60, 130), step=5)
+    area = c5.slider("Floor area (sqm)", 20, 500, (60, 130), step=5)
     c6, c7, c8 = st.columns(3)
     mfrom = c6.date_input("Month from", value=dt.date(2020, 1, 1))
     mto = c7.date_input("Month to", value=dt.date(2026, 12, 1))
@@ -49,7 +49,7 @@ def render(ctx: Ctx):
     sort_by = c9.selectbox("Sort by", ["resale_price", "month", "price_per_sqm",
                                        "floor_area_sqm"])
     sort_desc = c10.checkbox("Descending", value=True)
-    limit = c11.number_input("Limit", min_value=1, max_value=5000, value=200, step=50)
+    limit = c11.number_input("Limit by entries", min_value=1, max_value=5000, value=200, step=50)
 
     params = dict(
         towns=towns, flat_types=flat_types, flat_models=flat_models,
@@ -72,22 +72,29 @@ def render(ctx: Ctx):
                     if eng == "postgres":
                         rows, t, q = pg.filter(params, int(limit)); record(t)
                         show_timing(t)
-                        st.code(q, language="sql")
+                        if not rows:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(q, language="sql")
                         if rows:
                             st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
                         if show_plan:
-                            st.text(pg.explain_last())
+                            st.text(pg.explain_filter(params, int(limit)))
                     else:
                         docs, t, q = mongo.filter(params, int(limit)); record(t)
                         show_timing(t)
-                        st.code(json.dumps(q, default=str, indent=2), language="json")
+                        if not docs:
+                            st.info("No results found.")
+                        with st.expander("Query"):
+                            st.code(json.dumps(q, default=str, indent=2), language="json")
                         if docs:
                             st.dataframe(pd.json_normalize(docs), width="stretch",
                                          height=360)
                         if show_plan:
-                            st.json(mongo.explain_last())
-                except Exception as e:
-                    st.error(f"{eng}: {type(e).__name__}: {e}")
+                            st.json(mongo.explain_filter(params, int(limit)))
+                except Exception as exc:
+                    name = "PostgreSQL" if eng == "postgres" else "MongoDB"
+                    st.error(f"{name} filter failed: {type(exc).__name__}: {exc}")
         if fe == "Both":
             st.info("Same predicate, two engines. Note the SQL text vs the Mongo "
                     "query document, and compare the millisecond figures above.")

@@ -15,12 +15,16 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
+import json
 import re
 
 from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
 from pymongo.errors import OperationFailure
 
-from .timing import stopwatch, Timing
+from . import pricecheck
+from .timing import stopwatch, Timing, benchmark_timing
+from .query_utils import EARTH_RADIUS_M
+from .mutations import normalize_create, updates
 
 VALIDATOR = {
     "$jsonSchema": {
@@ -28,6 +32,8 @@ VALIDATOR = {
         "required": ["_id", "month", "flat_type", "floor_area_sqm",
                      "resale_price", "block"],
         "properties": {
+            "month": {"bsonType": "date"},
+            "remaining_lease_months": {"bsonType": ["int","long","null"], "minimum":0,"maximum":1188},
             "flat_type": {"bsonType": "string"},
             "floor_area_sqm": {"bsonType": ["double", "int"],
                                "minimum": 0, "exclusiveMinimum": True},
@@ -56,6 +62,9 @@ INDEXES = [
     ("ix_blockid",     [("block.block_id", ASCENDING)]),
     ("ix_mrt_dist",    [("block.nearest.mrt.distance_m", ASCENDING)]),
     ("ix_location",    [("block.location", GEOSPHERE)]),
+    # price check: equality on town + flat_type, range on month, then price_per_sqm
+    ("ix_pricecheck",  [("block.town", ASCENDING), ("flat_type", ASCENDING),
+                        ("month", ASCENDING), ("price_per_sqm", ASCENDING)]),
 ]
 
 SORT_FIELD = {
@@ -88,7 +97,7 @@ class MongoRepo:
         with stopwatch("rebuild database (drop + collection + indexes)", "mongodb") as t:
             # A rebuild must not leave stale collections or metadata behind.
             # The database is recreated implicitly when the collection is made.
-            self.client.drop_database(self.db_name)
+            self.client[self.db_name].drop_collection(self.coll_name)
             db = self.client[self.db_name]
             if with_validator:
                 db.create_collection(
@@ -151,13 +160,22 @@ class MongoRepo:
         return doc, t
 
     def create_transaction(self, doc: dict):
+        doc = normalize_create(doc)
         with stopwatch("create (1 doc, $jsonSchema validated)", "mongodb") as t:
             self.coll.insert_one(doc)
         return t
 
     def update_transaction(self, txn_id: str, fields: dict):
         with stopwatch(f"update ({len(fields)} field/s)", "mongodb") as t:
-            res = self.coll.update_one({"_id": txn_id}, {"$set": fields})
+            current=self.coll.find_one({'_id':txn_id})
+            if current is None:
+                t.rows=0
+                return t
+            fields=updates(current,fields)
+            # Compare-and-set prevents overwriting a concurrent edit with stale derived values.
+            guard={key:current.get(key) for key in ['resale_price','floor_area_sqm','remaining_lease']}
+            res = self.coll.update_one({"_id": txn_id,**guard}, {"$set": fields})
+            if not res.matched_count: raise RuntimeError('Concurrent transaction edit; retry the update')
         t.rows = res.modified_count
         return t
 
@@ -209,50 +227,86 @@ class MongoRepo:
             q["block.location"] = {
                 "$geoWithin": {
                     "$centerSphere": [[np_["lon"], np_["lat"]],
-                                     np_["radius_m"] / 6_378_137.0]
+                                     np_["radius_m"] / EARTH_RADIUS_M]
                 }
             }
         return q
 
-    def filter(self, p: dict, limit: int = 200):
+    def _filter_cursor(self, p: dict, limit: int):
         q = self.build_query(p)
         sort_field = SORT_FIELD.get(p.get("sort_by") or "resale_price", "resale_price")
         direction = DESCENDING if p.get("sort_desc", True) else ASCENDING
+        return q, self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(int(limit))
+
+    def filter(self, p: dict, limit: int = 200):
         with stopwatch("filter query", "mongodb") as t:
-            docs = list(self.coll.find(q).sort(sort_field, direction).limit(int(limit)))
+            q, cursor = self._filter_cursor(p, limit)
+            docs = list(cursor)
         t.rows = len(docs)
-        self._last_find = (q, sort_field, direction, int(limit))
         return docs, t, q
 
-    def explain_last(self) -> dict:
-        """Explain the most recent filter() exactly as run (sort + limit included)."""
-        if getattr(self, "_last_find", None) is None:
-            return {"note": "run a filter first"}
-        q, sort_field, direction, limit = self._last_find
-        cursor = self.coll.find(q).sort(sort_field, direction).limit(limit)
+    def explain_filter(self, p: dict, limit: int = 200) -> dict:
+        """Explain the supplied filter, including its ordering and limit."""
+        _, cursor = self._filter_cursor(p, limit)
         return cursor.explain().get("executionStats", {})
+
+    # -------------------------------------------------- price check ----- #
+    def price_check(self, target, months: int = 12, storey_range: str | None = None):
+        """Where does ``target`` (a transaction id or a flat dict) sit among comparable
+        recent sales? Returns ``(result, timing, pipeline_text)``; see :mod:`src.pricecheck`."""
+        def resolve(txn_id):
+            doc = self.coll.find_one({"_id": txn_id})
+            if not doc:
+                return None
+            return dict(transaction_id=doc["_id"], town=doc["block"]["town"],
+                        flat_type=doc["flat_type"], floor_area_sqm=doc["floor_area_sqm"],
+                        price_per_sqm=doc.get("price_per_sqm"), resale_price=doc["resale_price"],
+                        storey_range=doc.get("storey_range"))
+
+        def latest():
+            doc = self.coll.find_one({}, {"month": 1}, sort=[("month", DESCENDING)])
+            return doc["month"].date() if doc else None
+
+        def stats(spec):
+            pipeline = price_check_pipeline(spec)
+            facet = next(iter(self.coll.aggregate(pipeline, allowDiskUse=True)))
+            row = facet["stats"][0] if facet["stats"] else None
+            shown = json.dumps(pipeline, default=str, indent=1)
+            if row is None:
+                return dict(n=0), shown
+            return dict(n=row["n"], lo=row["lo"], hi=row["hi"], median=row["median"],
+                        p25=row["pct"][0], p75=row["pct"][1], median_price=row["median_price"],
+                        cheaper=_first_count(facet["cheaper"]),
+                        equal=_first_count(facet["equal"])), shown
+
+        with stopwatch(pricecheck.LABEL, "mongodb") as t:
+            result, text = pricecheck.run(resolve, latest, stats, target, months, storey_range)
+        t.rows = result["comparable_count"]
+        return result, t, text
 
     # -------------------------------------------------- benchmark ------- #
     def benchmark(self, repeat: int = 5) -> list[Timing]:
+        if repeat<1: raise ValueError("Benchmark repetitions must be positive")
         results: list[Timing] = []
-        ids = self.sample_ids(20)
-        pid = ids[0] if ids else None
-        town_doc = self.coll.find_one({}, {"block.town": 1})
+        first=self.coll.find_one({}, {"_id":1},sort=[("_id",ASCENDING)])
+        pid=first["_id"] if first else None
+        town_doc = self.coll.find_one({}, {"block.town": 1}, sort=[('block.town', ASCENDING)])
         some_town = town_doc["block"]["town"] if town_doc else None
         centre_doc = self.coll.find_one({"block.location": {"$ne": None}},
-                                       {"block.location": 1})
+                                       {"block.location": 1}, sort=[('block.block_id', ASCENDING)])
         centre = centre_doc["block"]["location"]["coordinates"] if centre_doc else None
 
         # Labels must match PgRepo.benchmark exactly: the GUI pairs the two
         # engines by label. Engine-specific detail goes in extra["how"].
         def run(label, how, fn):
             best, rows = None, 0
+            samples=[]
             for _ in range(repeat):
                 with stopwatch(label, "mongodb") as t:
                     rows = fn()
+                samples.append(t.ms)
                 best = t.ms if best is None else min(best, t.ms)
-            results.append(Timing(label=label, engine="mongodb", ms=best,
-                                  rows=rows, extra={"how": how}))
+            results.append(benchmark_timing(label,"mongodb",samples,rows,how))
 
         if pid:
             run("point lookup by id", "_id index",
@@ -276,17 +330,28 @@ class MongoRepo:
                 lambda: len(list(
                     self.coll.find({"block.town": some_town})
                     .sort("resale_price", DESCENDING).limit(20))))
+        newest = self.coll.find_one({}, {"_id": 1}, sort=[("month", DESCENDING), ("_id", ASCENDING)])
+        if newest:
+            samples, res = [], None
+            for _ in range(repeat):
+                res, t, _ = self.price_check(newest["_id"], months=12)
+                samples.append(t.ms)
+            results.append(benchmark_timing(
+                pricecheck.LABEL, "mongodb", samples, res["comparable_count"],
+                "$match (compound index) + $facet: $group with $median/$percentile, two counts"))
         run("substring search on street",
             "$regex over every transaction (block data is repeated per sale)",
             lambda: _agg_count(
                 self.coll, [{"$match": {"block.street_name": {"$regex": "TAMPINES",
                                                               "$options": "i"}}},
+                            {"$group": {"_id": "$block.block_id"}},
                             {"$count": "n"}]))
         if centre:
             run("geo radius 1 km", "2dsphere index, $geoWithin",
-                lambda: self.coll.count_documents(
-                    {"block.location": {"$geoWithin": {"$centerSphere": [
-                        centre, 1000 / 6_378_137.0]}}}))
+                lambda: _agg_count(self.coll, [
+                    {"$match": {"block.location": {"$geoWithin": {"$centerSphere": [
+                        centre, 1000 / EARTH_RADIUS_M]}}}},
+                    {"$group": {"_id": "$block.block_id"}}, {"$count": "n"}]))
         # A standalone mongod has no multi-document rollback, so write the
         # recomputed value into a scratch field and $unset it afterwards. The
         # value changes every repetition: otherwise MongoDB skips the no-op
@@ -305,6 +370,47 @@ class MongoRepo:
             self.coll.update_many({"_bench_psm": {"$exists": True}},
                                   {"$unset": {"_bench_psm": ""}})
         return results
+
+
+def price_check_pipeline(spec: dict) -> list:
+    """Comparable-sales summary for one comparison group (see :mod:`src.pricecheck`).
+
+    ``$match`` selects the group (using ``ix_pricecheck``); ``$facet`` then runs three
+    sub-pipelines over it in one pass: summary statistics (``$group`` with ``$min`` /
+    ``$max`` / ``$median`` / ``$percentile``) and the two rank counts. ``$median`` and
+    ``$percentile`` use the ``approximate`` method, so they are informational only.
+    """
+    match = {
+        "block.town": spec["town"],
+        "flat_type": spec["flat_type"],
+        "month": {"$gt": _as_dt(spec["cutoff"])},
+        "floor_area_sqm": {"$gte": spec["area_lo"], "$lte": spec["area_hi"]},
+        "price_per_sqm": {"$ne": None},
+    }
+    if spec["txn_id"] is not None:
+        match["_id"] = {"$ne": spec["txn_id"]}
+    if spec["storey_range"]:
+        match["storey_range"] = spec["storey_range"]
+    target = spec["target_psm"]
+    return [
+        {"$match": match},
+        {"$facet": {
+            "stats": [{"$group": {
+                "_id": None, "n": {"$sum": 1},
+                "lo": {"$min": "$price_per_sqm"}, "hi": {"$max": "$price_per_sqm"},
+                "median": {"$median": {"input": "$price_per_sqm", "method": "approximate"}},
+                "pct": {"$percentile": {"input": "$price_per_sqm", "p": [0.25, 0.75],
+                                        "method": "approximate"}},
+                "median_price": {"$median": {"input": "$resale_price", "method": "approximate"}},
+            }}],
+            "cheaper": [{"$match": {"price_per_sqm": {"$lt": target}}}, {"$count": "n"}],
+            "equal": [{"$match": {"price_per_sqm": target}}, {"$count": "n"}],
+        }},
+    ]
+
+
+def _first_count(rows) -> int:
+    return int(rows[0]["n"]) if rows else 0
 
 
 def _as_dt(d):

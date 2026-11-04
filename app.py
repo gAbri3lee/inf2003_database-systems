@@ -59,6 +59,12 @@ log_slot = layout.sidebar(ctx, provision_errors)
 roles.access_panel(access_popover, ctx)
 layout.hero()
 
+# Clear results from earlier UI versions before restoring the cloned screen.
+if not st.session_state.get("cloned_find_ui_restored"):
+    for state_key in ("ff_result", "ff_insights_data", "ff_loaded_profile", "ff_pending"):
+        st.session_state.pop(state_key, None)
+    st.session_state.cloned_find_ui_restored = True
+
 visible = [(label, mod) for label, cap, mod in TABS if ctx.can(cap)]
 for tab, (_, mod) in zip(st.tabs([label for label, _ in visible]), visible):
     with tab:

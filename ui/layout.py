@@ -76,6 +76,7 @@ def hero():
     first, _, last = APP_NAME.rpartition(" ")
     st.html(
         '<div class="hw-hero">'
+        '<i class="hw-walk-font-preload" aria-hidden="true">&#xe000;</i>'
         f'<div class="hw-brand">{html.escape(first)} <span>{html.escape(last)}</span></div>'
         '<div class="hw-tagline">Find the HDB resale flat that fits your life. Rank real '
         'sales by price, transport, schools, food and green space, and see exactly why '

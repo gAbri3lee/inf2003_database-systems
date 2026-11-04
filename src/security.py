@@ -8,7 +8,8 @@ change data even if the GUI had a bug: the database itself refuses.
     role    PostgreSQL login                     MongoDB user
     guest   hdb_reader  SELECT only              hdb_guest   read hdb
     member  hdb_reader  SELECT only              hdb_member  + write own data in hdb_users
-    editor  hdb_editor  + DML on transactions    hdb_editor  + write hdb.transactions
+    editor  hdb_editor  + DML on transactions    hdb_editor  + write hdb.transactions,
+            (and TEMP tables, for experiments)               hdb_experiments
     admin   owner (config.PG_USER)               hdb_admin   dbOwner on both databases
 
 :func:`provision_pg` / :func:`provision_mongo` create or update those logins
@@ -25,6 +26,7 @@ from psycopg import sql
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
 
+from .experiments import EXPERIMENT_DB
 from .mongo import MongoRepo
 from .pg import EDITOR_ROLE, GRANTS_SQL, READER_ROLE, PgRepo
 from .prefs import PrefsRepo
@@ -71,7 +73,9 @@ def mongo_role_defs(data_db: str, user_db: str) -> dict[str, dict]:
         "hdbEditor": {
             "privileges": [{"resource": {"db": data_db, "collection": "transactions"},
                             "actions": RW}],
-            "roles": [{"role": "hdbMember", "db": "admin"}],
+            # hdb_experiments only ever holds throwaway copies (src/experiments.py)
+            "roles": [{"role": "hdbMember", "db": "admin"},
+                      {"role": "readWrite", "db": EXPERIMENT_DB}],
         },
     }
 
@@ -101,6 +105,8 @@ def provision_pg(owner_dsn: str, db: str, owner: str, passwords: dict[str, str])
             # only our logins may connect, and nobody but the owner creates objects
             "REVOKE ALL ON DATABASE {db} FROM PUBLIC",
             "GRANT CONNECT ON DATABASE {db} TO {reader}",
+            # the index experiments copy sales into a TEMP table
+            "GRANT TEMPORARY ON DATABASE {db} TO {editor}",
             "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
             "GRANT USAGE ON SCHEMA public TO {reader}",
             # tables/views the owner creates later (rebuilds) are readable too

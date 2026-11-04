@@ -39,8 +39,7 @@ python -m streamlit run app.py
 powershell -ExecutionPolicy Bypass -File scripts\pg_stop.ps1
 ```
 
-There is no test suite, linter, or build step in this repo — it's a Streamlit
-prototype driven interactively through the browser UI at `http://localhost:8501`.
+Run `python -m pytest -q` with TEST_PG_DSN and TEST_MONGO_URI pointing to disposable test databases. The suite includes real database and Streamlit AppTest checks. See README and docs/actual-data-validation.json for full-data verification.
 
 Connection settings (host/port/user/db for both engines, and the CSV path)
 are centralized in [config.py](config.py); override via env vars
@@ -66,7 +65,7 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   (`MongoRepo`) are parallel, independent classes with a matching method
   surface: `build_schema`, `load`, `counts`, `distinct`, `sample_ids`,
   `get_transaction`/`create_transaction`/`update_transaction`/`delete_transaction`,
-  `filter`, `explain_last`, `benchmark`. `app.py` picks one or both based on
+  `filter`, `explain_last`, `benchmark`. The tabs pick one or both based on
   the user's engine radio button and calls the same method name on whichever
   repo(s) are selected — when adding a capability, implement it symmetrically
   on both repos so the GUI's "Both" mode keeps working.
@@ -88,15 +87,19 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   [src/security.py](src/security.py) (guest, member, editor, admin; each has
   `caps` that gate tabs/features). [ui/resources.py](ui/resources.py) builds
   per-role repos (memoized per role key) on that role's *own* DB logins:
-  PG `hdb_reader` (SELECT) / `hdb_editor` (+ DML on `transactions`, INSERT on
-  `flat_models`) / owner for admin; Mongo users `hdb_guest`/`hdb_member`/
+  PG `hdb_reader` (SELECT) / `hdb_editor` (+ DML on `transactions`, the
+  `flat_models` upsert, TEMP tables for experiments) / owner for admin; Mongo users `hdb_guest`/`hdb_member`/
   `hdb_editor`/`hdb_admin`. `resources.provision()` creates them once per
   server start with the owner accounts. Consequences: anything that does DDL,
   `collMod`, `createIndex` or `drop` must run as admin (load, restore,
   `PrefsRepo.ensure_schema`, `v_singles_resale` creation); table grants are
   lost on DROP, so `pg.GRANTS_SQL` is re-run by `build_schema` and restore.
   Shared read caches (`pg_distinct`, `site_stats`) use the guest repos.
-  MongoDB only enforces its users when `mongod` runs with `--auth`.
+  MongoDB only enforces its users when `mongod` runs with `--auth`. A new write
+  in any role's path needs its grant added (`pg.GRANTS_SQL`, `security.py`).
+  Tests run as admin with provisioning off (`tests/conftest.py`); GUI tests on
+  real databases opt in through the `provisioned` fixture. The Access panel
+  and the Admin matrix query the databases only while open.
 * **Backups** ([src/backup.py](src/backup.py), Admin tab): per-table
   `COPY ... csv.gz` + raw BSON per collection + SHA-256 manifest under
   `config.BACKUP_DIR`. PG restore is one transaction (SCHEMA_SQL + COPYs);
@@ -108,7 +111,7 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   memoized via `@st.cache_data` and cleared (`clear_data_caches`) after a
   reload/restore. Find-a-flat widgets all use `ff_*` keys and are never given
   `value=`; to change them programmatically (loading a profile/saved search),
-  set `st.session_state.ff_pending` and `st.rerun()` — `find_flat._apply`
+  set `st.session_state.ff_pending` and `st.rerun()` — `find_flat._ff_apply`
   writes the keys at the top of the next run, before the widgets exist.
 * Look and feel: widget colours, fonts and the dark sidebar come from
   [.streamlit/config.toml](.streamlit/config.toml) (only read at server
@@ -121,9 +124,31 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   `PgRepo.score_flats` ranks sales with `PERCENT_RANK()` window functions over
   `v_transactions_full` (factors in `SCORE_FACTORS`), while
   [src/prefs.py](src/prefs.py) (`PrefsRepo`) stores user profiles, saved
-  searches and search history in MongoDB. Those live in a separate database
-  (`MONGO_USER_DB`, default `hdb_users`) because `MongoRepo.build_schema` drops
-  the whole `MONGO_DB` on every reload.
+  searches, search history and a per-user flat **shortlist** (`shortlists`
+  collection: PostgreSQL `transaction_id` by value + a snapshot; current rows
+  come back via `PgRepo.get_flats_by_ids`) in MongoDB. Those live in a separate database
+  (`MONGO_USER_DB`, default `hdb_users`) for isolation. Reloads stage and replace only the transaction collection.
+  New `PrefsRepo` collections must be added to `VALIDATORS`/`INDEXES`; the
+  weight-repair migration in `ensure_schema` is limited to `WEIGHTED_COLLECTIONS`.
+* [src/experiments.py](src/experiments.py) powers the Benchmark tab's "Index
+  experiments" expander. It only ever works on temporary copies (a Mongo
+  collection in `hdb_experiments`, a PostgreSQL `TEMP` table) and removes them in
+  a `finally`; never point it at the real `transactions` collection/table.
+* [src/report.py](src/report.py) builds the "Save as PDF" sheet for the selected
+  Find a flat result (pure functions, no Streamlit/DB). The button passes a
+  callable to `st.download_button`, so the PDF and its OpenStreetMap map fetch
+  only happen on click; `fetch_map_image` returns `None` on any failure and the
+  PDF degrades to coordinates plus a map link. Tests inject fake tiles.
+* [src/pricecheck.py](src/pricecheck.py) holds everything the Find a flat **Price
+  check** must keep identical on both engines (comparable-sales definition,
+  widening levels, the `(cheaper + 0.5 * equal) / n` rank, the tag, `differences()`);
+  `PgRepo.price_check` / `MongoRepo.price_check` only supply the three callbacks
+  (`resolve`, `latest`, `stats`) to `pricecheck.run`, so the engines can only differ in
+  how they count. Its Mongo index `ix_pricecheck` needs a "Build schema + load CSV"
+  on existing databases; the benchmark pairs it under the label `pricecheck.LABEL`.
+* Quick search 9 (`floor_premium`) is a pure pipeline in `quick_mongo.py`
+  (`$setWindowFields`/`$shift`); keep `$round` inside pipelines since `_run`
+  rewrites it to PostgreSQL's ties-away-from-zero rounding (Mongo's own is ties-to-even).
 * The GUI pairs benchmark results across engines **by label**, so each
   operation must have the identical label in `PgRepo.benchmark` and
   `MongoRepo.benchmark`; put engine-specific detail in `Timing.extra["how"]`.
@@ -151,10 +176,10 @@ for either engine:
   (`HAVERSINE` in [src/pg.py](src/pg.py)) over the (small) `blocks` table.
 
 `filter()` on both repos takes the same predicate dict shape (see the
-`params` dict built in the Filter tab of `app.py`) and translates it into
+`params` dict in `ui/filter_tab.py`) and translates it into
 either a parameterized SQL query or a Mongo query document — when adding a
 new filter field, add it to both `PgRepo.filter` and `MongoRepo.build_query`
-and to the `params` dict in `app.py`.
+and to the `params` dict in `ui/filter_tab.py`.
 
 Full schema field listings, the GUI walkthrough, troubleshooting steps, and
 the SQL-vs-NoSQL findings this prototype is meant to demonstrate are in

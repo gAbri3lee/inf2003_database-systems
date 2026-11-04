@@ -1,5 +1,5 @@
 """CRUD: create / read / update / delete one transaction, timed per engine
-(Editor role and up)."""
+(Editor role and up). Paired writes go through ``coordinated_write``."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,12 +7,15 @@ import uuid
 
 import pandas as pd
 import streamlit as st
+from bson.json_util import dumps as bson_dumps
 
 from src import cleaning
 from src.mongo import MongoRepo
+from src.mutations import coordinated_write
+from src.transaction_display import mongo_transaction_row
 
-from .common import engines_from_choice, record, show_timing
-from .resources import Ctx, clear_summary
+from .common import drop_results, engines_from_choice, record, show_timing
+from .resources import Ctx, clear_summary, mongo_distinct
 
 
 def _mongo_doc_from_input(m: MongoRepo, data: dict) -> dict:
@@ -40,12 +43,14 @@ def _mongo_doc_from_input(m: MongoRepo, data: dict) -> dict:
 
 
 def render(ctx: Ctx):
-    pg, mongo = ctx.pg, ctx.mongo
+    pg, mongo, pg_ok = ctx.pg, ctx.mongo, ctx.pg_ok
     st.subheader("Create / Read / Update / Delete — timed on each engine")
     target = st.radio("Engine", ["PostgreSQL", "MongoDB", "Both"],
                       horizontal=True, key="crud_engine")
     op = st.selectbox("Operation", ["Read", "Create", "Update", "Delete"])
     engines = engines_from_choice(target)
+    if op != "Read" and not pg_ok:
+        st.warning("PostgreSQL must be online to save transaction changes in any engine.")
 
     def _sample_id():
         try:
@@ -61,17 +66,28 @@ def render(ctx: Ctx):
         if cc1.button("Fill sample id"):
             st.session_state.last_id = _sample_id(); st.rerun()
         if st.button("Read", type="primary") and tid:
-            if "postgres" in engines:
-                rows, t = pg.get_transaction(tid); record(t); show_timing(t)
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), width="stretch")
-            if "mongodb" in engines:
-                doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
-                if doc:
-                    st.json(doc, expanded=False)
-            if target == "Both":
-                st.caption("SQL returns a flat row assembled from 8 tables; "
-                           "MongoDB returns the whole nested document in one hit.")
+            try:
+                if "postgres" in engines:
+                    rows, t = pg.get_transaction(tid); record(t); show_timing(t)
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                    else:
+                        st.info('No transaction found in PostgreSQL for this ID.')
+                if "mongodb" in engines:
+                    doc, t = mongo.get_transaction(tid); record(t); show_timing(t)
+                    if doc:
+                        st.dataframe(pd.DataFrame([mongo_transaction_row(doc)]), width="stretch", column_config={
+                            'month': st.column_config.DateColumn('month', format='YYYY-MM-DD')})
+                        with st.expander('MongoDB document'):
+                            st.json(bson_dumps(doc), expanded=False)
+                    else:
+                        st.info('No transaction found in MongoDB for this ID.')
+                if target == "Both":
+                    st.caption("Both tables use the same columns. PostgreSQL reads its joined view; "
+                               "MongoDB's embedded fields are flattened for display.")
+            except Exception as e:
+                st.error(f"Read failed: {type(e).__name__}: {e}")
 
     # ---- CREATE ------------------------------------------------------- #
     elif op == "Create":
@@ -80,7 +96,10 @@ def render(ctx: Ctx):
                    "Try an unknown block_id or a negative price to see it reject.")
         with st.form("create_form"):
             g1, g2, g3 = st.columns(3)
-            new_id = g1.text_input("transaction_id", value=f"TX_demo_{uuid.uuid4().hex[:10]}")
+            # A changing default changes Streamlit's widget identity and can
+            # discard the submitted ID. Keep the draft default across reruns.
+            draft_id = st.session_state.setdefault("crud_draft_id", f"TX_demo_{uuid.uuid4().hex[:10]}")
+            new_id = g1.text_input("transaction_id", value=draft_id, key="crud_new_id")
             block_id = g2.text_input("block_id (must exist in blocks)",
                                      value=st.session_state.get("demo_block", ""))
             month = g3.date_input("month", value=dt.date(2025, 1, 1))
@@ -93,7 +112,7 @@ def render(ctx: Ctx):
             resale_price = g8.number_input("resale_price", value=550000.0, step=1000.0)
             remaining_lease = g9.text_input("remaining_lease", value="90 years 00 months")
             fill = st.form_submit_button("Fill block_id from data")
-            submitted = st.form_submit_button("Create", type="primary")
+            submitted = st.form_submit_button("Create", type="primary", disabled=not pg_ok)
         if fill:
             try:
                 st.session_state.demo_block = (
@@ -112,19 +131,15 @@ def render(ctx: Ctx):
                 lease_commence_year=None, remaining_lease=remaining_lease,
                 remaining_lease_months=cleaning._lease_to_months(remaining_lease),
             )
-            if "postgres" in engines:
-                try:
-                    t = pg.create_transaction(data); record(t); show_timing(t)
-                    clear_summary()                      # banner's sale count changed
-                except Exception as e:
-                    st.error(f"PostgreSQL rejected the insert → {type(e).__name__}: {e}")
-            if "mongodb" in engines:
-                try:
-                    doc = _mongo_doc_from_input(mongo, data)
-                    t = mongo.create_transaction(doc); record(t); show_timing(t)
-                except Exception as e:
-                    st.error(f"MongoDB rejected the insert → {type(e).__name__}: {e}")
-            st.session_state.last_id = new_id
+            try:
+                doc=_mongo_doc_from_input(mongo,data) if 'mongodb' in engines else None
+                for t in coordinated_write(pg,mongo,engines,'create',new_id,data,doc): record(t);show_timing(t)
+                clear_summary()
+                mongo_distinct.clear()
+                drop_results()
+                st.session_state.last_id=new_id
+            except Exception as e:
+                st.error(f'Create failed: {type(e).__name__}: {e}')
 
     # ---- UPDATE ----------------------------------------------------- #
     elif op == "Update":
@@ -134,35 +149,29 @@ def render(ctx: Ctx):
                                        "floor_area_sqm"])
         raw = st.text_input("New value", value="600000")
         numeric = field in ("resale_price", "price_per_sqm", "floor_area_sqm")
-        if st.button("Update", type="primary") and tid:
+        if st.button("Update", type="primary", disabled=not pg_ok) and tid:
             try:
                 val: object = float(raw) if numeric else raw
             except ValueError:
                 st.error(f"'{raw}' isn't a number.")
                 engines = []                 # skip both updates below
-            if "postgres" in engines:
+            if engines:
                 try:
-                    t = pg.update_transaction(tid, {field: val}); record(t); show_timing(t)
+                    for t in coordinated_write(pg,mongo,engines,'update',tid,{field:val}): record(t);show_timing(t)
+                    clear_summary()
+                    mongo_distinct.clear()
+                    drop_results()
                 except Exception as e:
-                    st.error(f"PostgreSQL rejected the update → {type(e).__name__}: {e}")
-            if "mongodb" in engines:
-                try:
-                    t = mongo.update_transaction(tid, {field: val}); record(t); show_timing(t)
-                except Exception as e:
-                    st.error(f"MongoDB rejected the update → {type(e).__name__}: {e}")
+                    st.error(f'Update failed: {type(e).__name__}: {e}')
 
     # ---- DELETE --------------------------------------------------- #
     elif op == "Delete":
         tid = st.text_input("transaction_id", value=st.session_state.get("last_id", ""))
-        if st.button("Delete", type="primary") and tid:
-            if "postgres" in engines:
-                try:
-                    t = pg.delete_transaction(tid); record(t); show_timing(t)
-                    clear_summary()                      # banner's sale count changed
-                except Exception as e:
-                    st.error(f"PostgreSQL rejected the delete → {type(e).__name__}: {e}")
-            if "mongodb" in engines:
-                try:
-                    t = mongo.delete_transaction(tid); record(t); show_timing(t)
-                except Exception as e:
-                    st.error(f"MongoDB rejected the delete → {type(e).__name__}: {e}")
+        if st.button("Delete", type="primary", disabled=not pg_ok) and tid:
+            try:
+                for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
+                clear_summary()
+                mongo_distinct.clear()
+                drop_results()
+            except Exception as e:
+                st.error(f'Delete failed: {type(e).__name__}: {e}')

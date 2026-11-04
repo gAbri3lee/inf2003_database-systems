@@ -11,7 +11,7 @@ from src.loader import run_load
 from src.security import ROLES
 
 from . import roles
-from .common import record
+from .common import drop_results, record
 from .resources import Ctx, clear_data_caches, site_stats
 
 MONGO_DBS = [config.MONGO_DB, config.MONGO_USER_DB]
@@ -37,7 +37,8 @@ def _take_backup(ctx: Ctx, label: str):
 
 def _load_section(ctx: Ctx):
     st.markdown("##### :material/upload_file: Load data")
-    st.caption("Drops and rebuilds both databases from the CSV.")
+    st.caption("Replaces the resale data in both databases with the CSV. User data in "
+               "`hdb_users` is left alone.")
     has_data = site_stats() is not None
     csv_path = st.text_input("CSV path", value=str(config.CSV_PATH))
     limit = st.number_input("Row limit (0 = all ≈ 171k)", min_value=0, max_value=2_000_000,
@@ -53,20 +54,23 @@ def _load_section(ctx: Ctx):
         if backup_first and has_data and _take_backup(ctx, "before reload") is None:
             st.warning("Reload cancelled because the backup failed.")
             return
-        with st.spinner("Loading… (first full run ≈ 1–2 min)"):
-            try:
+        try:
+            with st.spinner("Loading… (first full run ≈ 1–2 min)"):
                 rep = run_load(csv_path, ctx.pg, ctx.mongo,
                                limit=None if limit == 0 else int(limit),
                                do_pg=load_pg, do_mongo=load_mongo, mongo_validator=validator)
-            except Exception as e:
-                st.error(f"Load failed: {type(e).__name__}: {e}")
-                return
-        st.session_state.report = rep
-        record(*rep.timings)
-        clear_data_caches()
-        st.success(f"Loaded {rep.rows_loaded:,} rows (dropped {rep.dropped_invalid} invalid). "
-                   f"PG {rep.total_ms('postgres')/1000:.1f}s · "
-                   f"Mongo {rep.total_ms('mongodb')/1000:.1f}s")
+            st.session_state.report = rep
+            record(*rep.timings)
+            clear_data_caches()
+            drop_results()
+            if rep.rejected_rows:
+                st.warning(f"Excluded {len(rep.rejected_rows)} invalid CSV rows; source unchanged.")
+                st.dataframe(pd.DataFrame(rep.rejected_rows))
+            st.success(f"Loaded {rep.rows_loaded:,} rows (dropped {rep.dropped_invalid} invalid). "
+                       f"PG {rep.total_ms('postgres')/1000:.1f}s · "
+                       f"Mongo {rep.total_ms('mongodb')/1000:.1f}s")
+        except Exception as e:
+            st.error(f"Load failed; check the validation/recovery error: {type(e).__name__}: {e}")
 
 
 def _backup_section(ctx: Ctx):
@@ -131,7 +135,7 @@ def _backup_section(ctx: Ctx):
             else:
                 record(*timings)
                 clear_data_caches()
-                st.session_state.pop("ff_result", None)   # may point at rows that changed
+                drop_results()                    # may point at rows that changed
                 st.success(f"Restored the backup from {pick.created:%d %b %Y %H:%M}.")
         st.caption("PostgreSQL restores in a single transaction and MongoDB swaps each "
                    "collection in atomically, so a failed restore leaves the current "
@@ -140,7 +144,8 @@ def _backup_section(ctx: Ctx):
 
 def _access_section():
     st.markdown("##### :material/shield_person: Who can do what")
-    st.caption("Read back from each role's own database logins.")
+    if not st.toggle("Read each role's rights from the databases", key="adm_access"):
+        return
     frames = []
     for key, role in ROLES.items():
         m = roles.matrix(key)

@@ -101,3 +101,38 @@
   font-size: 0.78rem;
   color: #334155;
 }
+.hw-walk-icon {
+  display: inline-block;
+  width: 1em;
+  height: 1.2em;
+  background-color: currentColor;
+  --walk-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13.5 5.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM9.8 8.9 7 23h2.1l1.8-8 2.1 2v6h2v-7.5l-2.1-2 .6-3C14.8 12 16.7 13 19 13v-2c-1.9 0-3.5-1-4.3-2.4l-1-1.6c-.4-.6-1-1-1.7-1-.3 0-.5.1-.8.1L6 8.3V13h2V9.6l1.8-.7z'/%3E%3C/svg%3E");
+  -webkit-mask: var(--walk-mask) center / contain no-repeat;
+  mask: var(--walk-mask) center / contain no-repeat;
+  vertical-align: -0.2em;
+}
+/* Darker outlines for enabled, unselected radio options throughout the UI. */
+[role="radiogroup"] label:has(input[type="radio"]:not(:checked):not(:disabled)) > div > div:first-child {
+  border-color: #94A3B8 !important;
+}
+[role="radiogroup"] label:has(input[type="radio"]:not(:checked):not(:disabled)):hover > div > div:first-child {
+  border-color: #64748B !important;
+}
+/* Icon-only font face: U+E000 is a monochrome walker at its original size.
+   All ordinary UI characters retain the existing font and size. */
+@font-face {
+  font-family: "Inter";
+  src: url("data:font/ttf;base64,AAEAAAAKAIAAAwAgT1MvMjnsLw4AAACsAAAATmNtYXAADOAzAAAA/AAAACxnbHlmTXGl0QAAASgAAADdaGVhZGFuRJIAAAIIAAAANmhoZWEGGQJbAAACQAAAACRobXR4BLAAKAAAAmQAAAAIbG9jYQAAAOcAAAJsAAAADG1heHAABQApAAACeAAAACBuYW1lDEEcWwAAApgAAACwcG9zdAADAAAAAANIAAAAIAAAAlgBkAAFAAAAAAAAAAAAAAAAAAAAAAAAADIBLAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIV1NHAEDgAOAAA+gAAAAAA+gAAAAAAAAAAQADAAEAAAAMAAQAIAAAAAQABAABAADgAP//AADgAP//IAEAAQAAAAAAAAAAAAAAAAAAAAIAKAAoAjADhAAPACYAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQGk//r/7//m/+H/4f/m/+//+gAGABEAGgAfAB8AGgAR/yL/kABUAEgAVAAAAFAAAP+sABgAUAA8AFAAAP+w/6T/2P+8/+D/MAAAAFAAAAM0/+H/5v/v//oABgARABoAHwAfABoAEQAG//r/7//m/wn9zAAAAUD/sP8QAAABLABQAHj/tP/oAAAAUAAMAFQAQAAo//z/qP9EAAAAiAAAAAABAAAAAQAApcJjEl8PPPUAAwPoAAAAAAAAAAAAAAAAAAAAAAAoACgCMAOEAAAACAACAAEAAAAAAAEAAAPoAAAAAAJYAAAAAAIwAAEAAAAAAAAAAAAAAAAAAAACAlgAAAJYACgAAAAAAAAACgAAAN0AAQAAAAIAJwACAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAQANgADAAEECQABABoAAAADAAEECQACAA4AGgADAAEECQAEACoAKAADAAEECQAGACgAUgBIAG8AbQBlAFcAaQBzAGUAIABXAGEAbABrAFIAZQBnAHUAbABhAHIASABvAG0AZQBXAGkAcwBlACAAVwBhAGwAawAgAFIAZQBnAHUAbABhAHIASABvAG0AZQBXAGkAcwBlAFcAYQBsAGsALQBSAGUAZwB1AGwAYQByAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") format("truetype");
+  font-style: normal;
+  font-weight: 100 900;
+  unicode-range: U+E000;
+}
+.hw-walk-font-preload {
+  position: absolute;
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-size: 1px;
+  opacity: 0;
+  pointer-events: none;
+}

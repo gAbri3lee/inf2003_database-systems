@@ -16,9 +16,12 @@ mongodata/
 
 # Runtime output
 *.log
+.pytest_cache/
+test-results.xml
 
 # Local datasets
 *.csv
+!data/HDB_Compass_trimmed_cleaned.csv
 
 # Editor and OS metadata
 .vscode/
@@ -28,3 +31,5 @@ Thumbs.db
 CLAUDE.md
 # Database backups (Admin tab)
 backups/
+
+!.env.example

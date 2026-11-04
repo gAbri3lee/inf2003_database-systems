@@ -26,6 +26,12 @@ def record(*timings: Timing):
             st.session_state.log.append(t)
 
 
+def drop_results():
+    """Forget the last Find a flat result (and what was derived from it) once the data changes."""
+    st.session_state.pop("ff_result", None)
+    st.session_state.pop("ff_sl_price", None)
+
+
 def show_timing(t: Timing, prefix: str = ""):
     rows = f" · {t.rows:,} row(s)" if t.rows is not None else ""
     engine = html.escape(t.engine)
