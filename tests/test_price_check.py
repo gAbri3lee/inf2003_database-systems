@@ -80,10 +80,10 @@ def _ok(rank=32.0, n=214, level=0, storey=None, months=12):
 
 def test_sentences_read_naturally():
     assert pc.describe(_ok(32.0)) == (
-        'Cheaper than 68% of 214 similar sales in Tampines, 4 ROOM, 100 to 120 sqm, '
+        'Price percentile 32 (ties count half) among 214 similar sales in Tampines, 4 ROOM, 100 to 120 sqm, '
         'last 12 months')
-    assert pc.describe(_ok(81.4)).startswith('More expensive than 81% of 214')
-    assert pc.describe(_ok(50.0)).startswith('Right in the middle of 214')
+    assert pc.describe(_ok(81.4)).startswith('Price percentile 81.4 (ties count half) among 214')
+    assert pc.describe(_ok(50.0)).startswith('Price percentile 50 (ties count half) among 214')
     assert ', storey 04 TO 06,' in pc.describe(_ok(storey='04 TO 06'))
     assert pc.describe(dict(status='missing_data', message='no price')) == 'no price'
 
@@ -423,7 +423,8 @@ def test_gui_price_check_card_on_both_engines(pc_gui):
     assert app.selectbox(key='ff_pc_months').value == 12
     (sentence,) = _sentences(app)
     assert 'similar sales in Town A, 4 ROOM' in sentence and 'last 12 months' in sentence
-    assert sentence.startswith(('**Cheaper than', '**More expensive than', '**Right in the middle'))
+    assert sentence.startswith('**Price percentile')
+    assert 'ties count half' in sentence
     assert [e.label for e in app.expander if e.label.startswith('Show the query')] == [
         'Show the query (MongoDB)']
     app.radio(key='ff_pc_engine').set_value('Both').run()
@@ -432,6 +433,8 @@ def test_gui_price_check_card_on_both_engines(pc_gui):
         'Show the query (PostgreSQL)', 'Show the query (MongoDB)']
     assert any('agree on the number of sales' in c.value for c in app.caption)
     assert not any('disagree' in w.value for w in app.warning)
+    assert any('PostgreSQL (interpolated) · median' in c.value for c in app.caption)
+    assert any('MongoDB (approximate) · median' in c.value for c in app.caption)
     assert any('does not account for remaining lease' in c.value for c in app.caption)
 
 
@@ -488,3 +491,28 @@ def test_gui_shortlist_tags_and_flats_missing_from_the_dataset(pc_gui):
     app.button(key='ff_sl_pricecheck').click().run()
     assert not app.exception and not app.error
     assert any('unavailable: no longer in the dataset' in c.value for c in app.caption)
+
+
+def test_gui_retries_only_failed_price_engine(pc_gui, monkeypatch):
+    from src.mongo import MongoRepo
+
+    pc_gui(_target_and_group([4000.0 + 100 * k for k in range(25)]))
+    app = _app()
+    original = MongoRepo.price_check
+    attempts = []
+
+    def fail_once(self, *args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError('temporary database outage')
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MongoRepo, 'price_check', fail_once)
+    app.button(key='ff_find').click().run()
+    assert any('temporary database outage' in e.value for e in app.error)
+    app.radio(key='ff_pc_engine').set_value('Both').run()
+    assert [t.engine for t in _price_check_log(app)] == ['postgres']
+    app.button(key='ff_pc_retry').click().run()
+    assert not app.exception and not app.error
+    assert len(attempts) == 2
+    assert [t.engine for t in _price_check_log(app)] == ['postgres', 'mongodb']

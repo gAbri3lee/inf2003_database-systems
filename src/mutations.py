@@ -98,35 +98,38 @@ def coordinated_write(pg,mongo,engines,operation,txn_id,data=None,doc=None):
     """
     if operation not in {'create','update','delete'}: raise ValueError('Unsupported write operation')
     paired={'postgres','mongodb'}<=set(engines)
-    snapshot=mongo.coll.find_one({'_id':txn_id}) if paired else None
-    timings=[]
-    try:
-        with pg.atomic() if 'postgres' in engines else nullcontext():
-            if paired and operation!='create':
-                sql_rows=pg.get_transaction(txn_id)[0]
-                if bool(sql_rows)!=(snapshot is not None):
-                    raise ValueError('Databases disagree on transaction existence; reconcile before a paired write')
-                if sql_rows:
-                    for key in ('resale_price','floor_area_sqm','remaining_lease'):
-                        a,b=sql_rows[0].get(key),snapshot.get(key)
-                        if (float(a)!=float(b) if key!='remaining_lease' else a!=b):
-                            raise ValueError('Databases contain different transaction values; reconcile before a paired write')
-            if 'postgres' in engines:
-                if operation=='create': t=pg.create_transaction(data)
-                elif operation=='update': t=pg.update_transaction(txn_id,data)
-                else: t=pg.delete_transaction(txn_id)
-                timings.append(t)
-            if 'mongodb' in engines:
-                if operation=='create': t=mongo.create_transaction(doc)
-                elif operation=='update': t=mongo.update_transaction(txn_id,data)
-                else: t=mongo.delete_transaction(txn_id)
-                timings.append(t)
-    except Exception as exc:
-        if paired:
-            try:
-                if snapshot is None: mongo.coll.delete_one({'_id':txn_id})
-                else: mongo.coll.replace_one({'_id':txn_id},snapshot,upsert=True)
-            except Exception as recovery:
-                raise RuntimeError('Paired write failed and MongoDB recovery failed; reconcile this transaction before continuing') from recovery
-        raise
-    return timings
+    with pg.paired_write_lock(txn_id) if paired else nullcontext():
+        snapshot=mongo.coll.find_one({'_id':txn_id}) if paired else None
+        timings=[]
+        mongo_attempted = False
+        try:
+            with pg.atomic() if 'postgres' in engines else nullcontext():
+                if paired and operation!='create':
+                    sql_rows=pg.get_transaction(txn_id)[0]
+                    if bool(sql_rows)!=(snapshot is not None):
+                        raise ValueError('Databases disagree on transaction existence; reconcile before a paired write')
+                    if sql_rows:
+                        for key in ('resale_price','floor_area_sqm','remaining_lease'):
+                            a,b=sql_rows[0].get(key),snapshot.get(key)
+                            if (float(a)!=float(b) if key!='remaining_lease' else a!=b):
+                                raise ValueError('Databases contain different transaction values; reconcile before a paired write')
+                if 'postgres' in engines:
+                    if operation=='create': t=pg.create_transaction(data)
+                    elif operation=='update': t=pg.update_transaction(txn_id,data)
+                    else: t=pg.delete_transaction(txn_id)
+                    timings.append(t)
+                if 'mongodb' in engines:
+                    mongo_attempted = True
+                    if operation=='create': t=mongo.create_transaction(doc)
+                    elif operation=='update': t=mongo.update_transaction(txn_id,data)
+                    else: t=mongo.delete_transaction(txn_id)
+                    timings.append(t)
+        except Exception:
+            if paired and mongo_attempted:
+                try:
+                    if snapshot is None: mongo.coll.delete_one({'_id':txn_id})
+                    else: mongo.coll.replace_one({'_id':txn_id},snapshot,upsert=True)
+                except Exception as recovery:
+                    raise RuntimeError('Paired write failed and MongoDB recovery failed; reconcile this transaction before continuing') from recovery
+            raise
+        return timings

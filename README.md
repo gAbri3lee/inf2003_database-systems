@@ -162,7 +162,7 @@ database is already using port 5433 or 27017.
    is sent in those tile requests); if the map service can't be reached, the
    PDF prints the coordinates and a Google Maps link instead.
    * **Price check** — a card in the score-breakdown panel puts the selected
-   flat's price next to the evidence: e.g. *"Cheaper than 68% of 214 similar
+   flat's price next to the evidence: e.g. *"Price percentile 32 (ties count half) among 214 similar
    sales in Tampines, 4 ROOM, 100 to 120 sqm, last 12 months"*, with a plain
    tag (*Lower than most* / *Typical* / *Higher than most*), the median and
    middle-half range, and a small chart with the flat marked. Choose

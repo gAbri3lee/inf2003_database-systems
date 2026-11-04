@@ -287,6 +287,16 @@ class PgRepo:
             c.close()
 
     @contextmanager
+    def paired_write_lock(self, transaction_id: str):
+        """Hold a session lock across SQL rollback/commit and MongoDB recovery."""
+        with psycopg.connect(self.dsn, autocommit=True) as c:
+            c.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                (f"homewise:paired-write:{transaction_id}",),
+            )
+            yield  # Closing this dedicated connection releases the session lock.
+
+    @contextmanager
     def atomic(self):
         """Share one transaction across repository calls; inner commits are deferred."""
         class Deferred:

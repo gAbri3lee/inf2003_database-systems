@@ -428,31 +428,36 @@ def _ff_price_check(r: pd.Series, cache: dict):
         if st.checkbox(f"Only flats on storeys {r['storey_range']}", key="ff_pc_storey"):
             storey = r["storey_range"]
 
-    # one run per (flat, engine, period, storey): reruns reuse it, so the operation log
-    # records the check once. The cache lives in ff_result, so a new search or any data
-    # change discards it.
-    key = (str(r["transaction_id"]), choice, months, storey)
-    if key not in cache:
-        out = {}
-        for eng in engines_from_choice(choice):
-            repo = pg if eng == "postgres" else mongo
-            try:
-                out[eng] = repo.price_check(_pc_flat(r), months, storey)
-            except Exception as exc:
-                out[eng] = exc
-        cache[key] = out
-        record(*[v[1] for v in out.values() if not isinstance(v, Exception)])
-    out = cache[key]
+    key = (str(r["transaction_id"]), months, storey)
+    checked = cache.setdefault(key, {})
+    engines = engines_from_choice(choice)
+    for eng in engines:
+        if eng in checked:
+            continue
+        repo = pg if eng == "postgres" else mongo
+        try:
+            checked[eng] = repo.price_check(_pc_flat(r), months, storey)
+        except Exception as exc:
+            checked[eng] = exc
+        else:
+            record(checked[eng][1])
+    out = {eng: checked[eng] for eng in engines}
 
     for eng, v in out.items():
         if isinstance(v, Exception):
             st.error(f"{ENGINE_NAMES[eng]} price check failed: {type(v).__name__}: {v}")
+    failed = [eng for eng, value in out.items() if isinstance(value, Exception)]
+    if failed:
+        def retry_failed():
+            for eng in failed:
+                checked.pop(eng, None)
+        st.button("Retry price check", key="ff_pc_retry", on_click=retry_failed)
     ok = {eng: v for eng, v in out.items() if not isinstance(v, Exception)}
     if not ok:
         return
     for _, t, _ in ok.values():
         show_timing(t)
-    res = next(iter(ok.values()))[0]
+    source, (res, _, _) = next(iter(ok.items()))
 
     if res["status"] == "ok":
         d, n = res["definition"], res["comparable_count"]
@@ -468,6 +473,8 @@ def _ff_price_check(r: pd.Series, cache: dict):
         m1, m2 = st.columns(2)
         m1.metric("This flat (\\$/sqm)", f"{res['target_price_per_sqm']:,.0f}")
         m2.metric("Median of similar sales", f"{res['median_price_per_sqm']:,.0f}")
+        qualifier = "approximate" if source == "mongodb" else "interpolated"
+        st.caption(f"Chart and summary: {ENGINE_NAMES[source]} ({qualifier} median and quartiles).")
         st.markdown(f"Middle half of similar sales: **\\${res['p25_price_per_sqm']:,.0f} to "
                     f"\\${res['p75_price_per_sqm']:,.0f}** per sqm")
         st.altair_chart(_pc_chart(res), width="stretch")
@@ -492,12 +499,14 @@ def _ff_price_check(r: pd.Series, cache: dict):
         else:
             st.caption(":material/check_circle: PostgreSQL and MongoDB agree on the number of "
                        "sales, the rank and the tag.")
-        gaps = pricecheck.informational_gaps(a, b)
-        if gaps:
-            st.caption("Median and quartiles differ slightly (PostgreSQL interpolates with "
-                       "`percentile_cont`; MongoDB's `$percentile` is approximate): " +
-                       "; ".join(f"{k.replace('_', ' ')} {x:,.2f} vs {y:,.2f}"
-                                 for k, (x, y) in gaps.items() if x is not None and y is not None))
+        if a["status"] == b["status"] == "ok":
+            for engine, result in (("PostgreSQL (interpolated)", a), ("MongoDB (approximate)", b)):
+                st.caption(
+                    f"{engine} · median {result['median_price_per_sqm']:,.0f} SGD/sqm · "
+                    f"middle half {result['p25_price_per_sqm']:,.0f}–"
+                    f"{result['p75_price_per_sqm']:,.0f} SGD/sqm · "
+                    f"median resale price {result['median_resale_price']:,.0f} SGD"
+                )
     for eng, (_, _, text) in ok.items():
         with st.expander(f"Show the query ({ENGINE_NAMES[eng]})", icon=":material/code:"):
             st.code(text, language="sql" if eng == "postgres" else "json")

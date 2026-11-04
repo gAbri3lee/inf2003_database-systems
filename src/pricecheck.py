@@ -224,16 +224,11 @@ def run(resolve, latest, stats, target, months: int = 12, storey_range: str | No
 
 
 def describe(res: dict) -> str:
-    """One plain sentence, e.g. "Cheaper than 68% of 214 similar sales in Tampines, ..."."""
+    """Describe the rank, including the half weight given to tied prices."""
     if res["status"] != "ok":
         return res["message"]
     d, n, rank = res["definition"], res["comparable_count"], res["percentile_rank"]
-    if rank < 50:
-        head = f"Cheaper than {int(100 - rank + 0.5)}% of"
-    elif rank > 50:
-        head = f"More expensive than {int(rank + 0.5)}% of"
-    else:
-        head = "Right in the middle of"
+    head = f"Price percentile {rank:g} (ties count half) among"
     storey = f", storey {d['storey_range']}" if d["storey_range"] else ""
     return (f"{head} {n:,} similar sales in {d['town'].title()}, {d['flat_type']}, "
             f"{d['area_min_sqm']:g} to {d['area_max_sqm']:g} sqm{storey}, last {d['months']} months")

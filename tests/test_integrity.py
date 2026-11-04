@@ -1,4 +1,7 @@
 import pytest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from psycopg.errors import UniqueViolation
 from src.cleaning import _lease_to_months, build_relational
 from src.loader import run_load
 from src.mutations import coordinated_write
@@ -31,6 +34,45 @@ def test_paired_failure_after_mongo_write_restores_both(repos,monkeypatch):
         coordinated_write(pg,mongo,['postgres','mongodb'],'update','TEST_TX_00',{'resale_price':600000})
     assert mongo.get_transaction('TEST_TX_00')[0]==before
     assert float(pg.get_transaction('TEST_TX_00')[0][0]['resale_price'])==before['resale_price']
+
+
+def test_concurrent_paired_create_preserves_winning_record(repos, monkeypatch):
+    pg, mongo = repos
+    tid = 'TEST_CONCURRENT_CREATE'
+    data = {**pg.get_transaction('TEST_TX_00')[0][0], 'transaction_id': tid}
+    doc = {**mongo.get_transaction('TEST_TX_00')[0], '_id': tid}
+    entered, release = Event(), Event()
+    original = mongo.create_transaction
+
+    def pause_after_mongo_write(doc):
+        result = original(doc)
+        entered.set()
+        assert release.wait(15)
+        return result
+
+    monkeypatch.setattr(mongo, 'create_transaction', pause_after_mongo_write)
+
+    def create():
+        return coordinated_write(pg, mongo, ['postgres', 'mongodb'], 'create', tid, data, doc)
+
+    with ThreadPoolExecutor(2) as pool:
+        winner = pool.submit(create)
+        try:
+            assert entered.wait(15)
+            with pg.conn(autocommit=True) as conn:
+                held = conn.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s, 0)) AS acquired",
+                    (f'homewise:paired-write:{tid}',),
+                ).fetchone()
+                assert not held['acquired']
+            duplicate = pool.submit(create)
+        finally:
+            release.set()
+        winner.result(timeout=15)
+        with pytest.raises(UniqueViolation):
+            duplicate.result(timeout=15)
+    assert pg.get_transaction(tid)[0]
+    assert mongo.get_transaction(tid)[0]
 
 def test_load_failure_preserves_existing_data(repos,csv_path,monkeypatch):
     pg,mongo=repos
