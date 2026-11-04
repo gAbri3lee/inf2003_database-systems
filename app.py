@@ -462,13 +462,13 @@ def _ff_price_check(r: pd.Series, cache: dict):
             st.info(f"Fewer than {pricecheck.MIN_COMPARABLES} sales matched the strict "
                     f"comparison ({counts} sales as it was widened), so it was widened: "
                     f"**{d['level_label'].lower()}**.", icon=":material/unfold_more:")
-        m1, m2, m3 = st.columns(3)
-        # "\$" keeps Streamlit's markdown from reading a pair of dollar signs as LaTeX;
-        # units go in the labels so the values fit a narrow column without truncating.
+        # Two big numbers fit the narrow panel; the range goes on its own line. "\$" stops
+        # Streamlit's markdown reading a pair of dollar signs as LaTeX.
+        m1, m2 = st.columns(2)
         m1.metric("This flat (\\$/sqm)", f"{res['target_price_per_sqm']:,.0f}")
-        m2.metric("Similar sales median (\\$/sqm)", f"{res['median_price_per_sqm']:,.0f}")
-        m3.metric("Middle half (\\$/sqm)",
-                  f"{res['p25_price_per_sqm']:,.0f}–{res['p75_price_per_sqm']:,.0f}")
+        m2.metric("Median of similar sales", f"{res['median_price_per_sqm']:,.0f}")
+        st.markdown(f"Middle half of similar sales: **\\${res['p25_price_per_sqm']:,.0f} to "
+                    f"\\${res['p75_price_per_sqm']:,.0f}** per sqm")
         st.altair_chart(_pc_chart(res), width="stretch")
         st.caption(f":orange[**◆**] this flat · bar = middle half of the {n:,} similar sales "
                    f"· white tick = median · line = cheapest (\\${res['min_price_per_sqm']:,.0f}) "
