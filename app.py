@@ -31,7 +31,7 @@ import streamlit as st
 from bson.json_util import dumps as bson_dumps
 
 import config
-from src import cleaning, experiments, quick, quick_mongo, report
+from src import cleaning, experiments, pricecheck, quick, quick_mongo, report
 from src.distance import WALK_M_PER_MIN, distance_label, walking_minutes
 from src.loader import run_load
 from src.mutations import coordinated_write
@@ -110,14 +110,25 @@ FILTER_KEYS = {
 FF_DEFAULTS = {
     "ff_towns": [], "ff_types": [], "ff_budget": 800_000, "ff_area": 0,
     "ff_lease": 0, "ff_months": 12, "ff_one_per_block": True,
+    # price check card (see src/pricecheck.py)
+    "ff_pc_engine": "MongoDB", "ff_pc_months": 12, "ff_pc_storey": False,
     **{f"ff_w_{k}": v for k, v in DEFAULT_WEIGHTS.items()},
 }
+PC_MONTH_OPTS = [6, 12, 24, 36]
+PC_BADGE = {pricecheck.TAG_LOW: "blue", pricecheck.TAG_TYPICAL: "gray",
+            pricecheck.TAG_HIGH: "orange"}
 
 
 def record(*timings: Timing):
     for t in timings:
         if t:
             st.session_state.log.append(t)
+
+
+def _drop_results():
+    """Forget the last Find a flat result (and what was derived from it) once the data changes."""
+    st.session_state.pop("ff_result", None)
+    st.session_state.pop("ff_sl_price", None)
 
 
 ENGINE_NAMES = {"postgres": "PostgreSQL", "mongodb": "MongoDB", "shared": "Shared"}
@@ -358,6 +369,142 @@ def _ff_map(df: pd.DataFrame, selected: int) -> pdk.Deck:
                     tooltip={"html": "<b>{label}</b><br/>Score {score} · {price}"})
 
 
+def _pc_flat(r) -> dict:
+    """The fields a price check needs, from a results-table row or a PostgreSQL row."""
+    keys = ("transaction_id", "town", "flat_type", "floor_area_sqm", "price_per_sqm",
+            "resale_price", "storey_range")
+    return {k: (None if pd.isna(r.get(k)) else r.get(k)) for k in keys}
+
+
+def _pc_chart(res: dict) -> alt.Chart:
+    """Cheapest-to-dearest line, middle-half bar and median tick of the comparable sales,
+    with this flat marked. Drawn from the summary only, so it costs no extra query."""
+    lo, hi, tgt = res["min_price_per_sqm"], res["max_price_per_sqm"], res["target_price_per_sqm"]
+    pad = 0.05 * max(max(hi, tgt) - min(lo, tgt), 1)
+    scale = alt.Scale(domain=[min(lo, tgt) - pad, max(hi, tgt) + pad], nice=False)
+    xt = "Price per sqm (SGD)"
+    d = pd.DataFrame([dict(lo=lo, p25=res["p25_price_per_sqm"], med=res["median_price_per_sqm"],
+                           p75=res["p75_price_per_sqm"], hi=hi, flat=tgt, row="similar sales")])
+    y = alt.Y("row:N", axis=None)
+    base = alt.Chart(d)
+    tips = [alt.Tooltip("lo:Q", title="Cheapest", format=",.0f"),
+            alt.Tooltip("p25:Q", title="25th percentile", format=",.0f"),
+            alt.Tooltip("med:Q", title="Median", format=",.0f"),
+            alt.Tooltip("p75:Q", title="75th percentile", format=",.0f"),
+            alt.Tooltip("hi:Q", title="Dearest", format=",.0f")]
+    whisker = base.mark_rule(color=LABEL_GREY, opacity=0.55).encode(
+        x=alt.X("lo:Q", scale=scale, title=xt), x2="hi:Q", y=y)
+    box = base.mark_bar(color=BRAND, opacity=0.8, size=24).encode(
+        x=alt.X("p25:Q", scale=scale, title=xt), x2="p75:Q", y=y, tooltip=tips)
+    median = base.mark_tick(color="white", thickness=3, size=24).encode(
+        x=alt.X("med:Q", scale=scale, title=xt), y=y)
+    flat = base.mark_point(shape="diamond", size=240, filled=True, color=ACCENT,
+                           stroke="white", strokeWidth=1.5, opacity=1).encode(
+        x=alt.X("flat:Q", scale=scale, title=xt), y=y,
+        tooltip=[alt.Tooltip("flat:Q", title="This flat", format=",.0f")])
+    return (whisker + box + median + flat).properties(height=80)
+
+
+def _pc_line(res: dict | None) -> str:
+    """One-line summary of a price check for a shortlist card."""
+    if res is None:
+        return "price check unavailable: no longer in the dataset"
+    if res["status"] == "ok":
+        return f"price check **{res['tag']}** · {pricecheck.describe(res)}"
+    return f"price check: {res['message']}"
+
+
+def _ff_price_check(r: pd.Series, cache: dict):
+    """The Price check card for the selected flat, shown inside the 'Why #N scored' panel."""
+    st.markdown("##### :material/balance: Price check")
+    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+    choice = c1.radio("Engine", ["PostgreSQL", "MongoDB", "Both"], horizontal=True,
+                      key="ff_pc_engine")
+    months = int(c2.selectbox("Compare with sales from the last", PC_MONTH_OPTS,
+                              key="ff_pc_months", format_func=lambda m: f"{m} months"))
+    storey = None
+    if r["storey_range"]:
+        if st.checkbox(f"Only flats on storeys {r['storey_range']}", key="ff_pc_storey"):
+            storey = r["storey_range"]
+
+    # one run per (flat, engine, period, storey): reruns reuse it, so the operation log
+    # records the check once. The cache lives in ff_result, so a new search or any data
+    # change discards it.
+    key = (str(r["transaction_id"]), choice, months, storey)
+    if key not in cache:
+        out = {}
+        for eng in engines_from_choice(choice):
+            repo = pg if eng == "postgres" else mongo
+            try:
+                out[eng] = repo.price_check(_pc_flat(r), months, storey)
+            except Exception as exc:
+                out[eng] = exc
+        cache[key] = out
+        record(*[v[1] for v in out.values() if not isinstance(v, Exception)])
+    out = cache[key]
+
+    for eng, v in out.items():
+        if isinstance(v, Exception):
+            st.error(f"{ENGINE_NAMES[eng]} price check failed: {type(v).__name__}: {v}")
+    ok = {eng: v for eng, v in out.items() if not isinstance(v, Exception)}
+    if not ok:
+        return
+    for _, t, _ in ok.values():
+        show_timing(t)
+    res = next(iter(ok.values()))[0]
+
+    if res["status"] == "ok":
+        d, n = res["definition"], res["comparable_count"]
+        st.badge(res["tag"], icon=":material/balance:", color=PC_BADGE[res["tag"]])
+        st.markdown(f"**{pricecheck.describe(res)}**")
+        if d["level"]:
+            counts = " → ".join(f"{t['count']:,}" for t in res["tried"])
+            st.info(f"Fewer than {pricecheck.MIN_COMPARABLES} sales matched the strict "
+                    f"comparison ({counts} sales as it was widened), so it was widened: "
+                    f"**{d['level_label'].lower()}**.", icon=":material/unfold_more:")
+        m1, m2, m3 = st.columns(3)
+        # "\$" keeps Streamlit's markdown from reading a pair of dollar signs as LaTeX;
+        # units go in the labels so the values fit a narrow column without truncating.
+        m1.metric("This flat (\\$/sqm)", f"{res['target_price_per_sqm']:,.0f}")
+        m2.metric("Similar sales median (\\$/sqm)", f"{res['median_price_per_sqm']:,.0f}")
+        m3.metric("Middle half (\\$/sqm)",
+                  f"{res['p25_price_per_sqm']:,.0f}–{res['p75_price_per_sqm']:,.0f}")
+        st.altair_chart(_pc_chart(res), width="stretch")
+        st.caption(f":orange[**◆**] this flat · bar = middle half of the {n:,} similar sales "
+                   f"· white tick = median · line = cheapest (\\${res['min_price_per_sqm']:,.0f}) "
+                   f"to dearest (\\${res['max_price_per_sqm']:,.0f}) · median resale price of "
+                   f"similar sales \\${res['median_resale_price']:,.0f}")
+    elif res["status"] == "missing_data":
+        st.warning(res["message"], icon=":material/help:")
+    else:
+        st.info(res["message"], icon=":material/search_off:")
+        if res["tried"]:
+            st.caption("Sales found at each step: " + " → ".join(
+                f"{t['label']}: {t['count']}" for t in res["tried"]))
+
+    if len(ok) == 2:
+        a, b = ok["postgres"][0], ok["mongodb"][0]
+        diffs = pricecheck.differences(a, b)
+        if diffs:
+            st.warning("The two engines disagree on: " + ", ".join(diffs),
+                       icon=":material/compare_arrows:")
+        else:
+            st.caption(":material/check_circle: PostgreSQL and MongoDB agree on the number of "
+                       "sales, the rank and the tag.")
+        gaps = pricecheck.informational_gaps(a, b)
+        if gaps:
+            st.caption("Median and quartiles differ slightly (PostgreSQL interpolates with "
+                       "`percentile_cont`; MongoDB's `$percentile` is approximate): " +
+                       "; ".join(f"{k.replace('_', ' ')} {x:,.2f} vs {y:,.2f}"
+                                 for k, (x, y) in gaps.items() if x is not None and y is not None))
+    for eng, (_, _, text) in ok.items():
+        with st.expander(f"Show the query ({ENGINE_NAMES[eng]})", icon=":material/code:"):
+            st.code(text, language="sql" if eng == "postgres" else "json")
+    st.caption("Compares price per sqm only: it does not account for remaining lease, "
+               "renovation, view or exact location. It compares with the most recent sales, so "
+               "an older sale can look cheap just because prices have risen since.")
+
+
 def _bench_chart(bf: pd.DataFrame) -> alt.Chart:
     """Grouped horizontal bars per operation. symlog (not log: bars start at 0,
     which log can't draw) so 0.2 ms and 3 s both stay readable."""
@@ -475,7 +622,7 @@ with st.sidebar:
                 st.session_state.report = rep
                 record(*rep.timings)
                 pg_distinct.clear(); mongo_distinct.clear(); _cached_summary.clear()
-                st.session_state.pop('ff_result', None)
+                _drop_results()
                 if rep.rejected_rows:
                     st.warning(f"Excluded {len(rep.rejected_rows)} invalid CSV rows; source unchanged.")
                     st.dataframe(pd.DataFrame(rep.rejected_rows))
@@ -664,7 +811,9 @@ with tab_find:
                             *[f"s_{k}" for k in FACTORS]]:
                     if col in df:
                         df[col] = df[col].astype(float)   # NUMERIC arrives as Decimal
-                ss.ff_result = {"df": df, "weights": weights, "sql": sql_text, "timing": t}
+                ss.ff_result = {"df": df, "weights": weights, "sql": sql_text, "timing": t,
+                                "pc": {}}
+                ss.ff_pc_months = (ss.ff_months if ss.get("ff_months") in PC_MONTH_OPTS else 12)
                 if user:
                     top_ids = df["transaction_id"].head(5).tolist() if len(df) else []
                     record(prefs.log_search(user, weights, filters, len(df), top_ids))
@@ -731,6 +880,8 @@ with tab_find:
                 if ignored:
                     st.caption("Not counted (weight 0): " + ", ".join(ignored))
                 tid = str(r["transaction_id"])
+                with st.container(border=True):
+                    _ff_price_check(r, res.setdefault("pc", {}))
                 # one-page PDF of this flat, built only when the button is clicked
                 pdf_flat = r.to_dict()
                 pdf_parts = [dict(label=FACTORS[k][0], weight=weights[k],
@@ -788,6 +939,25 @@ with tab_find:
             except Exception as exc:
                 current_rows = None          # lookup failed: don't claim sales are gone
                 st.warning(f"Could not look up the current sales in PostgreSQL: {exc}")
+            if st.button("Check prices", key="ff_sl_pricecheck", icon=":material/balance:",
+                         help="Price check every saved flat (uses the engine and period chosen "
+                              "in the Price check card; Both uses MongoDB)."):
+                eng = "postgres" if ss.ff_pc_engine == "PostgreSQL" else "mongodb"
+                repo = pg if eng == "postgres" else mongo
+                by_id = {}
+                for e in attach_current(shortlist, current_rows or []):
+                    if e["current"] is None:
+                        by_id[e["transaction_id"]] = None       # row no longer in the data
+                        continue
+                    try:
+                        by_id[e["transaction_id"]], t, _ = repo.price_check(
+                            _pc_flat(e["current"]), int(ss.ff_pc_months))
+                        record(t)
+                    except Exception as exc:
+                        by_id[e["transaction_id"]] = dict(
+                            status="error", message=f"{type(exc).__name__}: {exc}")
+                ss.ff_sl_price = {"by_id": by_id}
+            sl_prices = (ss.get("ff_sl_price") or {}).get("by_id", {})
             now_res = ss.get("ff_result")
             now_scores = (dict(zip(now_res["df"]["transaction_id"], now_res["df"]["score"]))
                           if now_res and not now_res["df"].empty else {})
@@ -811,6 +981,8 @@ with tab_find:
                         if cur.get("remaining_lease"):
                             facts.append(f"lease {cur['remaining_lease']}")
                     st.caption(" · ".join(facts))
+                    if tid in sl_prices:
+                        st.caption(":material/balance: " + _pc_line(sl_prices[tid]))
                     if cur is None and current_rows is not None:
                         st.warning("No longer in the dataset (it may have been reloaded or "
                                    "deleted). Showing what was saved.", icon=":material/warning:")
@@ -1042,7 +1214,7 @@ with tab_crud:
                 for t in coordinated_write(pg,mongo,engines,'create',new_id,data,doc): record(t);show_timing(t)
                 _cached_summary.clear()
                 mongo_distinct.clear()
-                st.session_state.pop('ff_result', None)
+                _drop_results()
                 st.session_state.last_id=new_id
             except Exception as e:
                 st.error(f'Create failed: {type(e).__name__}: {e}')
@@ -1066,7 +1238,7 @@ with tab_crud:
                     for t in coordinated_write(pg,mongo,engines,'update',tid,{field:val}): record(t);show_timing(t)
                     _cached_summary.clear()
                     mongo_distinct.clear()
-                    st.session_state.pop('ff_result', None)
+                    _drop_results()
                 except Exception as e:
                     st.error(f'Update failed: {type(e).__name__}: {e}')
 
@@ -1078,7 +1250,7 @@ with tab_crud:
                 for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
                 _cached_summary.clear()
                 mongo_distinct.clear()
-                st.session_state.pop('ff_result', None)
+                _drop_results()
             except Exception as e:
                 st.error(f'Delete failed: {type(e).__name__}: {e}')
 
@@ -1597,6 +1769,25 @@ with tab_notes:
   integrity; unanchored `$regex` and some `$group`s scan the whole collection;
   no cross-document rollback on a standalone `mongod`.
 
+### Price check: how "similar sales" are chosen
+* **Comparable sales:** same town and flat type, floor area within ±10 sqm, sold in
+  the last N months ending at the newest month in the data, excluding the flat
+  itself. Compared on **price per sqm** so size does not distort the result.
+* **At least 10 sales or no percentile.** Otherwise the group is widened in steps
+  (drop the storey filter, ±20 sqm, 24 months) and the step used is shown; if it is
+  still under 10 the app says so rather than inventing a number.
+* **Percentile rank** = (cheaper + 0.5 × equal) ÷ comparables × 100, identical on both
+  engines because they only count. Tags: ≤ 25 *Lower than most*, ≥ 75 *Higher than
+  most*, otherwise *Typical*. Median and quartiles are informational:
+  PostgreSQL interpolates (`percentile_cont`), MongoDB's `$percentile` / `$median` are
+  `approximate`.
+* **MongoDB features used:** `$match` on the compound index
+  `{block.town, flat_type, month, price_per_sqm}`, then one `$facet` (a `$group` of
+  statistics plus two counts) in a single pass. PostgreSQL uses a CTE with
+  `percentile_cont` and `COUNT(*) FILTER`.
+* **Limits:** price per sqm only: remaining lease, renovation, view and exact location
+  are not considered, and older sales are compared with the most recent ones.
+
 ### Try this in a demo
 1. **CRUD → Read → Both** on one id — compare ms *and* the flat row vs the
    nested document.
@@ -1607,6 +1798,8 @@ with tab_notes:
 4. **Benchmark** — measure each workload and inspect query plans. Explain observed
    results rather than assuming a winning engine. Bulk updates use different
    rollback strategies and are not identical write workloads.
+5. **Find a flat → Price check → Both** — same percentile and tag from a CTE
+   (`percentile_cont`) and a `$facet` pipeline; open *Show the query* for each.
         """
     )
 

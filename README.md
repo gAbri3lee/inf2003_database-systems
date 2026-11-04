@@ -161,6 +161,39 @@ database is already using port 5433 or 27017.
    OpenStreetMap tiles only when you click the button (the block's location
    is sent in those tile requests); if the map service can't be reached, the
    PDF prints the coordinates and a Google Maps link instead.
+   * **Price check** — a card in the score-breakdown panel puts the selected
+   flat's price next to the evidence: e.g. *"Cheaper than 68% of 214 similar
+   sales in Tampines, 4 ROOM, 100 to 120 sqm, last 12 months"*, with a plain
+   tag (*Lower than most* / *Typical* / *Higher than most*), the median and
+   middle-half range, and a small chart with the flat marked. Choose
+   PostgreSQL, MongoDB or **Both** (the engines' counts, rank and tag are
+   compared and any difference is flagged), the comparison period (6 / 12 /
+   24 / 36 months; it starts from your search's period) and optionally the same
+   storey range only. *Show the query* reveals the SQL / aggregation pipeline.
+   **Check prices** in the shortlist tags every saved flat on demand.
+   * *Comparable sales* are in the same town and flat type, within ±10 sqm
+   floor area, sold in the last N months ending at the newest month in the data,
+   excluding the flat itself and any sale without a price per sqm. They are
+   compared on **price per sqm**. With fewer than 10, the group is widened
+   one step at a time and the step used is shown: drop the storey filter (if
+   one was applied), then ±20 sqm, then a 24-month period. If it is still under
+   10 you get *not enough comparable sales* and the count, never an invented
+   percentile.
+   * The **percentile rank** is `(comparables cheaper + 0.5 × comparables
+   equal) ÷ comparables × 100`; the tag is *Lower than most* at 25 or below,
+   *Higher than most* at 75 or above, otherwise *Typical*. Both engines only
+   count; the rank is derived in one shared place, so it is identical. The
+   median and quartiles are informational: PostgreSQL interpolates
+   (`percentile_cont`) while MongoDB's `$percentile` / `$median` use the
+   `approximate` method, so they can differ slightly.
+   * Limits: it compares price per sqm only (not remaining lease, renovation,
+   view or exact location), and it compares with the most recent sales, so an
+   older sale can look cheap simply because prices have risen since.
+   MongoDB features used: `$match` on a compound index, `$facet`, `$group` with
+   `$min` / `$max` / `$median` / `$percentile`. The compound index
+   `ix_pricecheck` is created by **Build schema + load CSV**, so an existing
+   database needs a reload to get it (the check still works without it, only
+   slower).
    * **Shortlist** — with a profile selected, click a result row and then
    **Add to shortlist** (next to its score breakdown) to keep that specific
    flat. **`<profile>'s shortlist`** (below the results) lists up to 20 saved flats
@@ -180,10 +213,11 @@ database is already using port 5433 or 27017.
    document** side by side, with timings and an optional query plan.
 5. **Benchmark tab** — repeats a fixed set of operations N times and charts
    the median latency per engine with a speed-up column. Both engines run the
-   same 8 operations: point lookup by id, indexed range scan (price), group-by
+   same 9 operations: point lookup by id, indexed range scan (price), group-by
    town aggregate, monthly price trend, top-20 by price in one town (an
-   8-table view join in PostgreSQL vs. embedded documents in MongoDB), substring
-   search on street, geo radius (1 km) and a bulk update. The `how` column says
+   8-table view join in PostgreSQL vs. embedded documents in MongoDB), the
+   price check for the newest sale (a CTE with `percentile_cont` vs. a `$facet`
+   pipeline), substring search on street, geo radius (1 km) and a bulk update. The `how` column says
    how each engine executes them.
 
    **Index experiments** (expander at the bottom of the tab) shows what an
@@ -273,7 +307,8 @@ Relationship types present: **1-to-many** (`town→blocks`, `block→transaction
 ```
 
 Indexes: `block.town`, `flat_type`, `flat_model`, `month`, `resale_price`,
-compound `{block.town, resale_price}`, `block.street_name`, `block.block_id`,
+compound `{block.town, resale_price}`, compound `{block.town, flat_type, month,
+price_per_sqm}` (the price check), `block.street_name`, `block.block_id`,
 `block.nearest.mrt.distance_m`, and a **`2dsphere`** index on `block.location`.
 An optional `$jsonSchema` validator enforces required fields / positive prices.
 
@@ -338,6 +373,7 @@ Project/
 │  ├─ mongo.py            MongoRepo: schema+indexes, load, CRUD, filter, benchmark
 │  ├─ prefs.py            PrefsRepo: user profiles, saved searches, history, shortlist
 │  ├─ experiments.py      index experiments on temporary copies (Benchmark tab)
+│  ├─ pricecheck.py       price check: comparable sales, rank formula, tag, widening
 │  ├─ report.py           one-flat PDF (fpdf2) + OpenStreetMap map image
 │  ├─ quick.py / quick_mongo.py  the ten Quick search queries per engine
 │  ├─ mutations.py        write validation + paired PostgreSQL/MongoDB writes
