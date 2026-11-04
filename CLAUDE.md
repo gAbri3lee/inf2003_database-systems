@@ -112,6 +112,13 @@ CSV --[cleaning.load_dataframe]--> clean typed DataFrame
   callable to `st.download_button`, so the PDF and its OpenStreetMap map fetch
   only happen on click; `fetch_map_image` returns `None` on any failure and the
   PDF degrades to coordinates plus a map link. Tests inject fake tiles.
+* [src/pricecheck.py](src/pricecheck.py) holds everything the Find a flat **Price
+  check** must keep identical on both engines (comparable-sales definition,
+  widening levels, the `(cheaper + 0.5 * equal) / n` rank, the tag, `differences()`);
+  `PgRepo.price_check` / `MongoRepo.price_check` only supply the three callbacks
+  (`resolve`, `latest`, `stats`) to `pricecheck.run`, so the engines can only differ in
+  how they count. Its Mongo index `ix_pricecheck` needs a "Build schema + load CSV"
+  on existing databases; the benchmark pairs it under the label `pricecheck.LABEL`.
 * Quick search 9 (`floor_premium`) is a pure pipeline in `quick_mongo.py`
   (`$setWindowFields`/`$shift`); keep `$round` inside pipelines since `_run`
   rewrites it to PostgreSQL's ties-away-from-zero rounding (Mongo's own is ties-to-even).

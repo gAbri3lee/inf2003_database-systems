@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import datetime as dt
 import itertools
+import json
 import re
 
 from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
 from pymongo.errors import OperationFailure
 
+from . import pricecheck
 from .timing import stopwatch, Timing, benchmark_timing
 from .query_utils import EARTH_RADIUS_M
 from .mutations import normalize_create, updates
@@ -60,6 +62,9 @@ INDEXES = [
     ("ix_blockid",     [("block.block_id", ASCENDING)]),
     ("ix_mrt_dist",    [("block.nearest.mrt.distance_m", ASCENDING)]),
     ("ix_location",    [("block.location", GEOSPHERE)]),
+    # price check: equality on town + flat_type, range on month, then price_per_sqm
+    ("ix_pricecheck",  [("block.town", ASCENDING), ("flat_type", ASCENDING),
+                        ("month", ASCENDING), ("price_per_sqm", ASCENDING)]),
 ]
 
 SORT_FIELD = {
@@ -243,6 +248,40 @@ class MongoRepo:
         cursor = self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(limit)
         return cursor.explain().get("executionStats", {})
 
+    # -------------------------------------------------- price check ----- #
+    def price_check(self, target, months: int = 12, storey_range: str | None = None):
+        """Where does ``target`` (a transaction id or a flat dict) sit among comparable
+        recent sales? Returns ``(result, timing, pipeline_text)``; see :mod:`src.pricecheck`."""
+        def resolve(txn_id):
+            doc = self.coll.find_one({"_id": txn_id})
+            if not doc:
+                return None
+            return dict(transaction_id=doc["_id"], town=doc["block"]["town"],
+                        flat_type=doc["flat_type"], floor_area_sqm=doc["floor_area_sqm"],
+                        price_per_sqm=doc.get("price_per_sqm"), resale_price=doc["resale_price"],
+                        storey_range=doc.get("storey_range"))
+
+        def latest():
+            doc = self.coll.find_one({}, {"month": 1}, sort=[("month", DESCENDING)])
+            return doc["month"].date() if doc else None
+
+        def stats(spec):
+            pipeline = price_check_pipeline(spec)
+            facet = next(iter(self.coll.aggregate(pipeline, allowDiskUse=True)))
+            row = facet["stats"][0] if facet["stats"] else None
+            shown = json.dumps(pipeline, default=str, indent=1)
+            if row is None:
+                return dict(n=0), shown
+            return dict(n=row["n"], lo=row["lo"], hi=row["hi"], median=row["median"],
+                        p25=row["pct"][0], p75=row["pct"][1], median_price=row["median_price"],
+                        cheaper=_first_count(facet["cheaper"]),
+                        equal=_first_count(facet["equal"])), shown
+
+        with stopwatch(pricecheck.LABEL, "mongodb") as t:
+            result, text = pricecheck.run(resolve, latest, stats, target, months, storey_range)
+        t.rows = result["comparable_count"]
+        return result, t, text
+
     # -------------------------------------------------- benchmark ------- #
     def benchmark(self, repeat: int = 5) -> list[Timing]:
         if repeat<1: raise ValueError("Benchmark repetitions must be positive")
@@ -289,6 +328,15 @@ class MongoRepo:
                 lambda: len(list(
                     self.coll.find({"block.town": some_town})
                     .sort("resale_price", DESCENDING).limit(20))))
+        newest = self.coll.find_one({}, {"_id": 1}, sort=[("month", DESCENDING), ("_id", ASCENDING)])
+        if newest:
+            samples, res = [], None
+            for _ in range(repeat):
+                res, t, _ = self.price_check(newest["_id"], months=12)
+                samples.append(t.ms)
+            results.append(benchmark_timing(
+                pricecheck.LABEL, "mongodb", samples, res["comparable_count"],
+                "$match (compound index) + $facet: $group with $median/$percentile, two counts"))
         run("substring search on street",
             "$regex over every transaction (block data is repeated per sale)",
             lambda: _agg_count(
@@ -320,6 +368,47 @@ class MongoRepo:
             self.coll.update_many({"_bench_psm": {"$exists": True}},
                                   {"$unset": {"_bench_psm": ""}})
         return results
+
+
+def price_check_pipeline(spec: dict) -> list:
+    """Comparable-sales summary for one comparison group (see :mod:`src.pricecheck`).
+
+    ``$match`` selects the group (using ``ix_pricecheck``); ``$facet`` then runs three
+    sub-pipelines over it in one pass: summary statistics (``$group`` with ``$min`` /
+    ``$max`` / ``$median`` / ``$percentile``) and the two rank counts. ``$median`` and
+    ``$percentile`` use the ``approximate`` method, so they are informational only.
+    """
+    match = {
+        "block.town": spec["town"],
+        "flat_type": spec["flat_type"],
+        "month": {"$gt": _as_dt(spec["cutoff"])},
+        "floor_area_sqm": {"$gte": spec["area_lo"], "$lte": spec["area_hi"]},
+        "price_per_sqm": {"$ne": None},
+    }
+    if spec["txn_id"] is not None:
+        match["_id"] = {"$ne": spec["txn_id"]}
+    if spec["storey_range"]:
+        match["storey_range"] = spec["storey_range"]
+    target = spec["target_psm"]
+    return [
+        {"$match": match},
+        {"$facet": {
+            "stats": [{"$group": {
+                "_id": None, "n": {"$sum": 1},
+                "lo": {"$min": "$price_per_sqm"}, "hi": {"$max": "$price_per_sqm"},
+                "median": {"$median": {"input": "$price_per_sqm", "method": "approximate"}},
+                "pct": {"$percentile": {"input": "$price_per_sqm", "p": [0.25, 0.75],
+                                        "method": "approximate"}},
+                "median_price": {"$median": {"input": "$resale_price", "method": "approximate"}},
+            }}],
+            "cheaper": [{"$match": {"price_per_sqm": {"$lt": target}}}, {"$count": "n"}],
+            "equal": [{"$match": {"price_per_sqm": target}}, {"$count": "n"}],
+        }},
+    ]
+
+
+def _first_count(rows) -> int:
+    return int(rows[0]["n"]) if rows else 0
 
 
 def _as_dt(d):

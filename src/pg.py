@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from decimal import Decimal
 from .mutations import normalize_create, updates
 
 import pandas as pd
@@ -24,6 +25,7 @@ import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from . import pricecheck
 from .timing import stopwatch, Timing, benchmark_timing
 from .query_utils import EARTH_RADIUS_M, escape_like
 
@@ -207,6 +209,44 @@ SCORE_FACTORS = {
     "cbd":    ("distance_to_cbd_m", True),
     "lease":  ("remaining_lease_months", False),
 }
+
+
+def _price_check_sql(spec: dict) -> tuple[str, dict]:
+    """Comparable-sales summary for one comparison group (see :mod:`src.pricecheck`).
+
+    The CTE is the group; the rank is built from two ``COUNT(*) FILTER`` terms so it
+    uses the same (cheaper + 0.5 * equal) / n formula as the MongoDB pipeline.
+    """
+    storey = "      AND  t.storey_range = %(storey)s\n" if spec["storey_range"] else ""
+    query = f"""WITH comparable AS (
+    SELECT t.price_per_sqm, t.resale_price
+    FROM   transactions t
+    JOIN   blocks b  ON b.block_id = t.block_id
+    JOIN   towns  tw ON tw.town_id = b.town_id
+    WHERE  tw.name = %(town)s
+      AND  t.flat_type = %(flat_type)s
+      AND  t.month > %(cutoff)s
+      AND  t.floor_area_sqm BETWEEN %(area_lo)s AND %(area_hi)s
+      AND  t.price_per_sqm IS NOT NULL
+      AND  t.transaction_id IS DISTINCT FROM %(txn_id)s::text
+{storey})
+SELECT COUNT(*)                                                       AS n,
+       MIN(price_per_sqm)                                             AS lo,
+       MAX(price_per_sqm)                                             AS hi,
+       percentile_cont(0.5)  WITHIN GROUP (ORDER BY price_per_sqm)    AS median,
+       percentile_cont(0.25) WITHIN GROUP (ORDER BY price_per_sqm)    AS p25,
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY price_per_sqm)    AS p75,
+       percentile_cont(0.5)  WITHIN GROUP (ORDER BY resale_price)     AS median_price,
+       COUNT(*) FILTER (WHERE price_per_sqm <  %(target_psm)s)        AS cheaper,
+       COUNT(*) FILTER (WHERE price_per_sqm =  %(target_psm)s)        AS equal
+FROM   comparable"""
+    params = dict(
+        town=spec["town"], flat_type=spec["flat_type"], cutoff=spec["cutoff"],
+        area_lo=spec["area_lo"], area_hi=spec["area_hi"], txn_id=spec["txn_id"],
+        target_psm=Decimal(str(spec["target_psm"])))
+    if spec["storey_range"]:
+        params["storey"] = spec["storey_range"]
+    return query, params
 
 
 def _scalar(v):
@@ -495,6 +535,32 @@ class PgRepo:
         except Exception as e:  # pragma: no cover
             return f"(EXPLAIN unavailable: {e})"
 
+    # -------------------------------------------------- price check ----- #
+    def price_check(self, target, months: int = 12, storey_range: str | None = None):
+        """Where does ``target`` (a transaction id or a flat dict) sit among comparable
+        recent sales? Returns ``(result, timing, sql_text)``; see :mod:`src.pricecheck`."""
+        with self.conn(autocommit=True) as c:
+            def resolve(txn_id):
+                return c.execute(
+                    "SELECT transaction_id, town, flat_type, floor_area_sqm, price_per_sqm, "
+                    "resale_price, storey_range FROM v_transactions_full "
+                    "WHERE transaction_id = %s", (txn_id,)).fetchone()
+
+            def latest():
+                return c.execute("SELECT MAX(month) AS m FROM transactions").fetchone()["m"]
+
+            def stats(spec):
+                query, params = _price_check_sql(spec)
+                shown = "-- parameters: " + ", ".join(
+                    f"{k}={v!r}" for k, v in params.items()) + "\n" + query
+                return c.execute(query, params).fetchone(), shown
+
+            with stopwatch(pricecheck.LABEL, "postgres") as t:
+                result, text = pricecheck.run(resolve, latest, stats, target, months,
+                                              storey_range)
+        t.rows = result["comparable_count"]
+        return result, t, text
+
     # -------------------------------------------------- compatibility score #
     def score_flats(self, f: dict, weights: dict, limit: int = 50):
         """Rank recent sales by a weighted, explainable compatibility score.
@@ -626,6 +692,17 @@ class PgRepo:
             run("top-20 by price in one town", "8-table view, then sort",
                 "SELECT * FROM v_transactions_full WHERE town = %(t)s "
                 "ORDER BY resale_price DESC LIMIT 20", {"t": some_town})
+            newest = c.execute(
+                'SELECT transaction_id FROM transactions '
+                'ORDER BY month DESC, transaction_id COLLATE "C" LIMIT 1').fetchone()
+            if newest:
+                samples, res = [], None
+                for _ in range(repeat):
+                    res, t, _ = self.price_check(newest["transaction_id"], months=12)
+                    samples.append(t.ms)
+                results.append(benchmark_timing(
+                    pricecheck.LABEL, "postgres", samples, res["comparable_count"],
+                    "CTE over transactions+blocks+towns, percentile_cont + COUNT(*) FILTER"))
             run("substring search on street", "ILIKE over the ~10k-row blocks table",
                 "SELECT COUNT(*) AS n FROM blocks WHERE street_name ILIKE %(q)s",
                 {"q": "%TAMPINES%"}, count_row=True)
