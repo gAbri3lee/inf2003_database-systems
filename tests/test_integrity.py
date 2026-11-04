@@ -1,6 +1,7 @@
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from time import monotonic, sleep
 from psycopg.errors import UniqueViolation
 from src.cleaning import _lease_to_months, build_relational
 from src.loader import run_load
@@ -73,6 +74,62 @@ def test_concurrent_paired_create_preserves_winning_record(repos, monkeypatch):
             duplicate.result(timeout=15)
     assert pg.get_transaction(tid)[0]
     assert mongo.get_transaction(tid)[0]
+
+
+def test_mongo_only_edit_waits_for_paired_recovery(repos):
+    pg, mongo = repos
+    tid = 'TEST_TX_00'
+    before = mongo.get_transaction(tid)[0]['resale_price']
+    entered, release = Event(), Event()
+
+    class FailingMongo:
+        coll = mongo.coll
+
+        def update_transaction(self, *args):
+            mongo.update_transaction(*args)
+            entered.set()
+            assert release.wait(15)
+            raise RuntimeError('injected failure after Mongo update')
+
+    with ThreadPoolExecutor(2) as pool:
+        paired = pool.submit(coordinated_write, pg, FailingMongo(),
+                             ['postgres', 'mongodb'], 'update', tid, {'resale_price': 510000})
+        try:
+            assert entered.wait(10)
+            single = pool.submit(coordinated_write, pg, mongo, ['mongodb'],
+                                 'update', tid, {'resale_price': 620000})
+            deadline = monotonic() + 5
+            with pg.conn(autocommit=True) as conn:
+                while True:
+                    assert not single.done(), 'Mongo-only edit bypassed the recovery lock'
+                    waiting = conn.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                        "WHERE locktype = 'advisory' AND NOT granted) AS waiting"
+                    ).fetchone()['waiting']
+                    if waiting:
+                        break
+                    assert monotonic() < deadline, 'Mongo-only edit did not wait for the lock'
+                    sleep(0.02)
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match='injected failure'):
+            paired.result(timeout=10)
+        single.result(timeout=10)
+    assert float(pg.get_transaction(tid)[0][0]['resale_price']) == before
+    assert mongo.get_transaction(tid)[0]['resale_price'] == 620000
+
+
+def test_filter_plans_keep_request_parameters_when_filters_interleave(repos):
+    pg, mongo = repos
+    first = {'towns': ['TOWN A'], 'sort_by': 'month', 'sort_desc': False}
+    other = {'towns': ['TOWN B'], 'sort_by': 'resale_price'}
+    for repo in repos:
+        assert len(repo.filter(first, 1)[0]) == 1
+        assert len(repo.filter(other, 4)[0]) == 4
+    sql_plan = pg.explain_filter(first, 1)
+    assert 'TOWN A' in sql_plan and 'TOWN B' not in sql_plan
+    assert mongo.explain_filter(first, 1)['nReturned'] == 1
+    assert mongo.explain_filter(other, 4)['nReturned'] == 4
 
 def test_load_failure_preserves_existing_data(repos,csv_path,monkeypatch):
     pg,mongo=repos

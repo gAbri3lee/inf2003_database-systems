@@ -230,22 +230,22 @@ class MongoRepo:
             }
         return q
 
-    def filter(self, p: dict, limit: int = 200):
+    def _filter_cursor(self, p: dict, limit: int):
         q = self.build_query(p)
         sort_field = SORT_FIELD.get(p.get("sort_by") or "resale_price", "resale_price")
         direction = DESCENDING if p.get("sort_desc", True) else ASCENDING
+        return q, self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(int(limit))
+
+    def filter(self, p: dict, limit: int = 200):
         with stopwatch("filter query", "mongodb") as t:
-            docs = list(self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(int(limit)))
+            q, cursor = self._filter_cursor(p, limit)
+            docs = list(cursor)
         t.rows = len(docs)
-        self._last_find = (q, sort_field, direction, int(limit))
         return docs, t, q
 
-    def explain_last(self) -> dict:
-        """Explain the most recent filter() exactly as run (sort + limit included)."""
-        if getattr(self, "_last_find", None) is None:
-            return {"note": "run a filter first"}
-        q, sort_field, direction, limit = self._last_find
-        cursor = self.coll.find(q).sort([(sort_field, direction), ('_id', ASCENDING)]).limit(limit)
+    def explain_filter(self, p: dict, limit: int = 200) -> dict:
+        """Explain the supplied filter, including its ordering and limit."""
+        _, cursor = self._filter_cursor(p, limit)
         return cursor.explain().get("executionStats", {})
 
     # -------------------------------------------------- price check ----- #

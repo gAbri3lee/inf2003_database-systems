@@ -501,6 +501,9 @@ These are snapshot coordinates, not proof of historic amenity conditions.
 
 Price/area updates recalculate price per sqm. Lease-text updates recalculate months.
 Unsupported fields, invalid lease strings and non-finite prices are rejected.
+All transaction edits from the app use a PostgreSQL lock per sale ID, including
+edits that target MongoDB alone. PostgreSQL must be online for those edits.
+MongoDB reads still work independently.
 Paired writes use a PostgreSQL transaction with MongoDB compensation on reported
 failure. This is not a crash-safe distributed transaction: interrupted processes
 or unavailable recovery services still require reconciliation.

@@ -1133,6 +1133,8 @@ with tab_crud:
                       horizontal=True, key="crud_engine")
     op = st.selectbox("Operation", ["Read", "Create", "Update", "Delete"])
     engines = engines_from_choice(target)
+    if op != "Read" and not pg_ok:
+        st.warning("PostgreSQL must be online to save transaction changes in any engine.")
 
     def _sample_id():
         try:
@@ -1194,7 +1196,7 @@ with tab_crud:
             resale_price = g8.number_input("resale_price", value=550000.0, step=1000.0)
             remaining_lease = g9.text_input("remaining_lease", value="90 years 00 months")
             fill = st.form_submit_button("Fill block_id from data")
-            submitted = st.form_submit_button("Create", type="primary")
+            submitted = st.form_submit_button("Create", type="primary", disabled=not pg_ok)
         if fill:
             try:
                 st.session_state.demo_block = (
@@ -1231,7 +1233,7 @@ with tab_crud:
                                        "floor_area_sqm"])
         raw = st.text_input("New value", value="600000")
         numeric = field in ("resale_price", "price_per_sqm", "floor_area_sqm")
-        if st.button("Update", type="primary") and tid:
+        if st.button("Update", type="primary", disabled=not pg_ok) and tid:
             try:
                 val: object = float(raw) if numeric else raw
             except ValueError:
@@ -1249,7 +1251,7 @@ with tab_crud:
     # ---- DELETE --------------------------------------------------- #
     elif op == "Delete":
         tid = st.text_input("transaction_id", value=st.session_state.get("last_id", ""))
-        if st.button("Delete", type="primary") and tid:
+        if st.button("Delete", type="primary", disabled=not pg_ok) and tid:
             try:
                 for t in coordinated_write(pg,mongo,engines,'delete',tid): record(t);show_timing(t)
                 _cached_summary.clear()
@@ -1326,7 +1328,7 @@ with tab_filter:
                         if rows:
                             st.dataframe(pd.DataFrame(rows), width="stretch", height=360)
                         if show_plan:
-                            st.text(pg.explain_last())
+                            st.text(pg.explain_filter(params, int(limit)))
                     else:
                         docs, t, q = mongo.filter(params, int(limit)); record(t)
                         show_timing(t)
@@ -1338,7 +1340,7 @@ with tab_filter:
                             st.dataframe(pd.json_normalize(docs), width="stretch",
                                          height=360)
                         if show_plan:
-                            st.json(mongo.explain_last())
+                            st.json(mongo.explain_filter(params, int(limit)))
                 except Exception as exc:
                     name = "PostgreSQL" if eng == "postgres" else "MongoDB"
                     st.error(f"{name} filter failed: {type(exc).__name__}: {exc}")

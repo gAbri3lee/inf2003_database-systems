@@ -98,7 +98,8 @@ def coordinated_write(pg,mongo,engines,operation,txn_id,data=None,doc=None):
     """
     if operation not in {'create','update','delete'}: raise ValueError('Unsupported write operation')
     paired={'postgres','mongodb'}<=set(engines)
-    with pg.paired_write_lock(txn_id) if paired else nullcontext():
+    # Single-engine writes must wait for any paired recovery on the same sale.
+    with pg.transaction_write_lock(txn_id):
         snapshot=mongo.coll.find_one({'_id':txn_id}) if paired else None
         timings=[]
         mongo_attempted = False

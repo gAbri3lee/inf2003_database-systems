@@ -287,7 +287,7 @@ class PgRepo:
             c.close()
 
     @contextmanager
-    def paired_write_lock(self, transaction_id: str):
+    def transaction_write_lock(self, transaction_id: str):
         """Hold a session lock across SQL rollback/commit and MongoDB recovery."""
         with psycopg.connect(self.dsn, autocommit=True) as c:
             c.execute(
@@ -484,7 +484,7 @@ class PgRepo:
         return t
 
     # -------------------------------------------------- filter ----------- #
-    def filter(self, p: dict, limit: int = 200):
+    def _filter_query(self, p: dict, limit: int):
         where, params = [], {}
         if p.get("towns"):
             where.append("town = ANY(%(towns)s)"); params["towns"] = list(p["towns"])
@@ -525,21 +525,23 @@ class PgRepo:
             f"SELECT * FROM v_transactions_full\n{where_sql}\n"
             f"ORDER BY {sort_by} {sort_dir}, transaction_id\nLIMIT {int(limit)}"
         )
-        self._last_query, self._last_params = query, params
+        return query, params
+
+    def filter(self, p: dict, limit: int = 200):
+        query, params = self._filter_query(p, limit)
         with self.conn(autocommit=True) as c, stopwatch("filter query", "postgres") as t:
             rows = c.execute(query, params).fetchall()
         t.rows = len(rows)
         return rows, t, query
 
-    def explain_last(self) -> str:
-        """EXPLAIN (ANALYZE) the most recent filter() query."""
-        if not getattr(self, "_last_query", None):
-            return "(run a filter first)"
+    def explain_filter(self, p: dict, limit: int = 200) -> str:
+        """Explain the supplied filter, including its ordering and limit."""
+        query, params = self._filter_query(p, limit)
         try:
             with self.conn(autocommit=True) as c:
                 rows = c.execute(
-                    "EXPLAIN (ANALYZE, BUFFERS, COSTS) " + self._last_query,
-                    self._last_params,
+                    "EXPLAIN (ANALYZE, BUFFERS, COSTS) " + query,
+                    params,
                 ).fetchall()
             return "\n".join(r["QUERY PLAN"] for r in rows)
         except Exception as e:  # pragma: no cover
