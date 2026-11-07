@@ -47,9 +47,10 @@ class ScoringGuiTests(unittest.TestCase):
             self.assertEqual(len(app.tabs), 8)
             self.assertEqual(len([widget for widget in app.slider if (widget.key or '').startswith('ff_w_')]), 7)
             self.assertFalse(any(toggle.key == 'ff_match_enabled' for toggle in app.toggle))
-            overview = '\n'.join(item.proto.body for item in app.get('html')
-                                 if 'class="hw-score-chart"' in item.proto.body)
-            self.assertIn('Affordability: weight 70; maximum 22.6 points', overview)
+            self.assertFalse(any(expander.label == 'Your scoring priorities'
+                                 for expander in app.expander))
+            self.assertFalse(any('class="hw-score-chart"' in item.proto.body
+                                 for item in app.get('html')))
             app.button(key='ff_find').click().run()
             self.assertFalse(list(app.exception))
             self.assertFalse(list(app.error))
@@ -65,17 +66,18 @@ class ScoringGuiTests(unittest.TestCase):
             self.assertTrue(any('Why #1 scored 77 / 100' in item.value for item in app.markdown))
             charts = [item.proto.body for item in app.get('html')
                       if 'class="hw-score-chart"' in item.proto.body]
-            self.assertEqual(len(charts), 2)
+            self.assertEqual(len(charts), 1)
             self.assertIn('Affordability: earned 17.4 of 22.6 points; weight 70', charts[-1])
             self.assertIn('MRT access: earned 14.9 of 19.4 points; weight 60', charts[-1])
             self.assertFalse(any(expander.label == 'View all factor details' for expander in app.expander))
             self.assertIn('percentile score × weight ÷ total weight', charts[-1])
-            # Unsaved slider edits update the overview, not the previous search's breakdown.
+            # Unsaved slider edits must not relabel the previous search's breakdown.
             app.slider(key='ff_w_afford').set_value(0)
             app.run()
             charts = [item.proto.body for item in app.get('html')
                       if 'class="hw-score-chart"' in item.proto.body]
-            self.assertIn('Affordability: excluded; weight 0', charts[0])
+            self.assertEqual(len(charts), 1)
+            self.assertNotIn('Affordability: excluded; weight 0', charts[0])
             self.assertIn('Affordability: earned 17.4 of 22.6 points; weight 70', charts[-1])
             for factor in FACTORS:
                 app.slider(key='ff_w_'+factor).set_value(0)

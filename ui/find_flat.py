@@ -206,10 +206,17 @@ def _ff_score_chart(weights: dict, r: pd.Series | None = None) -> str:
                      if weight == largest and list(weights.values()).count(weight) > 1 else
                      "Highest priority in these settings. " if weight == largest else "") +
                     f"Its assigned weight is {weight} of {total} total priority units.")
+        earned_detail = ""
+        if flat:
+            earned_detail = (f'<br>Earned points: {float(r[f"s_{k}"]):.1f} × {weight} '
+                             f'÷ {total} = {earned[k]:.1f} earned points.' if weight > 0 else
+                             '<br>Earned points: 0 (this category is excluded because its weight is 0).')
+            earned_detail += (f'<br><strong>This flat earns {earned[k]:.1f} / '
+                              f'{maximum:.1f} points for {e(name)}.</strong>')
         reasons.append(f'<div><dt>{e(name)} · weight {weight}</dt>'
                        f'<dd>{e(FACTOR_PURPOSES[k])} {e(priority)}<br>'
                        f'<strong>{weight} ÷ {total} × 100 = {maximum:.1f} maximum points.</strong>'
-                       '</dd></div>')
+                       f'{earned_detail}</dd></div>')
     display_score = float(r["score"]) if flat else 100.0
     ring_class = f"hw-score-ring-{round(display_score * 10)}"
     heading = "Where the points came from" if flat else "How your 100 points are allocated"
@@ -222,8 +229,14 @@ def _ff_score_chart(weights: dict, r: pd.Series | None = None) -> str:
                        f'{ceiling[example]:.1f} maximum points')
     earned_example = (f'{float(r[f"s_{example}"]):.1f} × {weights[example]} ÷ {total} = '
                       f'{earned[example]:.1f} earned points' if flat else '')
-    formula = ('Earned points = percentile score × weight ÷ total weight' if flat else
-               'Maximum points = weight ÷ total weight × 100')
+    calculation = (
+        '<div class="hw-score-calculation"><strong>A simple calculation</strong>'
+        '<p>Maximum points = weight ÷ total weight × 100</p>'
+        f'<p>{e(FACTORS[example][0])}: {maximum_example}.</p>'
+        '<p>Earned points = percentile score × weight ÷ total weight</p>'
+        f'<p>For this flat: {earned_example}.</p></div>'
+        if flat else ''
+    )
     return (
         f'<section class="hw-score-chart" aria-label="{heading}">'
         # A scoped CSS ring works within Streamlit's sanitised HTML renderer.
@@ -242,9 +255,7 @@ def _ff_score_chart(weights: dict, r: pd.Series | None = None) -> str:
         '<p class="hw-score-note">All bars use the same points scale. '
         + ('' if flat else
            'Category maximums add up to 100 before rounding.') + '</p>'
-        '<div class="hw-score-calculation"><strong>A simple calculation</strong>'
-        f'<p>{formula}</p><p>{e(FACTORS[example][0])}: {maximum_example}.</p>'
-        + (f'<p>For this flat: {earned_example}.</p>' if flat else '') + '</div>'
+        + calculation +
         '<details class="hw-score-method"><summary>Why these weights and maximum scores?</summary>'
         '<p>The app starts with <strong>preassigned default weights</strong> for each category. '
         'You can adjust these using the sliders or load weights from a saved profile. '
@@ -864,9 +875,6 @@ def render(ctx: Ctx):
                 if user:
                     top_ids = df["transaction_id"].head(5).tolist() if len(df) else []
                     record(prefs.log_search(user, weights, filters, len(df), top_ids))
-
-    with st.expander("Your scoring priorities", expanded=not bool(ss.get("ff_result"))):
-        st.html(_ff_score_chart(_ff_weights()))
 
     _ff_results(ctx, user, shortlist, saved_ids)
     _ff_saved(ctx, user, shortlist)
