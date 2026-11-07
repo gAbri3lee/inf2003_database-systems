@@ -152,27 +152,114 @@ def _ff_card(rank: int, r: pd.Series) -> str:
     )
 
 
-def _ff_contrib_chart(r: pd.Series, weights: dict, active: list[str]) -> alt.Chart:
-    """Horizontal bars, largest contribution first, labelled with the points."""
+FACTOR_PURPOSES = {
+    "afford": "Purchase cost: lower resale prices within the same flat type score higher.",
+    "mrt": "Public transport access: a shorter distance to the nearest MRT scores higher.",
+    "school": "School access: a shorter distance to the nearest primary school scores higher.",
+    "hawker": "Food access: a shorter distance to the nearest hawker centre scores higher.",
+    "park": "Green space: a shorter distance to the nearest park scores higher.",
+    "cbd": "Central location: a shorter distance to the CBD scores higher.",
+    "lease": "Remaining tenure: more lease remaining scores higher.",
+}
+
+
+def _ff_score_chart(weights: dict, r: pd.Series | None = None) -> str:
+    """Present existing priorities/sub-scores; never rank or rescore a flat here."""
+    e = html.escape
     total = sum(weights.values())
-    data = pd.DataFrame({
-        "factor": [FACTORS[k][0] for k in active],
-        "points": [r[f"s_{k}"] * weights[k] / total for k in active],
-    })
-    base = alt.Chart(data).encode(
-        y=alt.Y("factor:N", sort="-x", title=None,
-                axis=alt.Axis(ticks=False, domain=False, labelFontSize=13, labelPadding=8)),
-        x=alt.X("points:Q", title="points added to the score",
-                axis=alt.Axis(grid=False, tickCount=4)),
-        tooltip=["factor", alt.Tooltip("points:Q", format=".1f")],
+    if total <= 0:
+        return ('<section class="hw-score-chart" aria-label="Scoring priorities">'
+                '<p>Set at least one priority above 0 to allocate your 100 points.</p></section>')
+    flat = r is not None
+    largest = max(weights.values())
+    ceiling = {k: 100 * weights.get(k, 0) / total for k in FACTORS}
+    earned = {k: (float(r[f"s_{k}"]) * weights[k] / total
+                  if flat and weights.get(k, 0) > 0 else 0.0) for k in FACTORS}
+    ordered = sorted(FACTORS, key=lambda k: earned[k] if flat else ceiling[k], reverse=True)
+    rows, reasons = [], []
+    for k in ordered:
+        name, weight, maximum = FACTORS[k][0], weights.get(k, 0), ceiling[k]
+        if weight == 0:
+            label = f"{name}: excluded; weight 0"
+            value = '<span>Not counted · 0 max pts</span>'
+            detail = "Weight 0 excludes this category from your score."
+        elif flat:
+            label = f"{name}: earned {earned[k]:.1f} of {maximum:.1f} points; weight {weight}"
+            value = f'{earned[k]:.1f} <span>/ {maximum:.1f} pts</span>'
+            detail = _ff_explain(k, r).split("**: ", 1)[-1]
+        else:
+            label = f"{name}: weight {weight}; maximum {maximum:.1f} points"
+            value = f'{maximum:.1f} <span>max pts</span>'
+            detail = FACTOR_PURPOSES[k]
+        fill = float(r[f"s_{k}"]) if flat and weight > 0 else (100 if weight else 0)
+        rows.append(
+            '<div class="hw-score-row">'
+            '<div class="hw-score-row-head"><div class="hw-score-row-title">'
+            f'<strong>{e(name)}</strong><span>Weight {weight} · {maximum:.1f}%</span></div>'
+            f'<div class="hw-score-points">{value}</div></div>'
+            f'<div class="hw-score-bar" role="img" aria-label="{e(label, quote=True)}">'
+            f'<div class="hw-score-track" style="width:{100 * weight / largest:.6f}%">'
+            f'<div class="hw-score-earned" style="width:{fill:.6f}%"></div></div></div>'
+            f'<p class="hw-score-detail">{e(detail)}</p></div>')
+        priority = ("Excluded because its assigned weight is 0." if weight == 0 else
+                    ("Shares the highest priority in these settings. "
+                     if weight == largest and list(weights.values()).count(weight) > 1 else
+                     "Highest priority in these settings. " if weight == largest else "") +
+                    f"Its assigned weight is {weight} of {total} total priority units.")
+        reasons.append(f'<div><dt>{e(name)} · weight {weight}</dt>'
+                       f'<dd>{e(FACTOR_PURPOSES[k])} {e(priority)}<br>'
+                       f'<strong>{weight} ÷ {total} × 100 = {maximum:.1f} maximum points.</strong>'
+                       '</dd></div>')
+    display_score = float(r["score"]) if flat else 100.0
+    ring_class = f"hw-score-ring-{round(display_score * 10)}"
+    heading = "Where the points came from" if flat else "How your 100 points are allocated"
+    ring_label = f"Score {display_score:.1f} out of 100" if flat else "100 maximum points"
+    legend = ('<span><i></i>Earned points</span><span><i class="hw-score-pale"></i>'
+              'Available with your weights</span>' if flat else
+              '<span><i></i>Maximum points per category</span>')
+    example = next(k for k in ordered if weights.get(k, 0) > 0)
+    maximum_example = (f'{weights[example]} ÷ {total} × 100 = '
+                       f'{ceiling[example]:.1f} maximum points')
+    earned_example = (f'{float(r[f"s_{example}"]):.1f} × {weights[example]} ÷ {total} = '
+                      f'{earned[example]:.1f} earned points' if flat else '')
+    formula = ('Earned points = percentile score × weight ÷ total weight' if flat else
+               'Maximum points = weight ÷ total weight × 100')
+    return (
+        f'<section class="hw-score-chart" aria-label="{heading}">'
+        # A scoped CSS ring works within Streamlit's sanitised HTML renderer.
+        f'<style>.{ring_class}::before {{background:conic-gradient('
+        f'var(--score-teal) {display_score:.6f}%, var(--score-track) 0);}}</style>'
+        '<div class="hw-score-chart-head">'
+        f'<div class="hw-score-ring {ring_class}" role="img" aria-label="{ring_label}">'
+        f'<div><strong>{display_score:.0f}</strong><small>{"/ 100" if flat else "max pts"}'
+        '</small></div></div>'
+        f'<div><h4>{heading}</h4><p>'
+        + ('Using weights from this search · ' if flat else 'Current priorities · ')
+        + f'Total weight {total}'
+        + (f' · Score {display_score:.1f} / 100' if flat else
+           ' · A larger weight gives a category more influence.') + '</p></div></div>'
+        f'<div class="hw-score-legend">{legend}</div>' + ''.join(rows) +
+        '<p class="hw-score-note">All bars use the same points scale. '
+        + ('' if flat else
+           'Category maximums add up to 100 before rounding.') + '</p>'
+        '<div class="hw-score-calculation"><strong>A simple calculation</strong>'
+        f'<p>{formula}</p><p>{e(FACTORS[example][0])}: {maximum_example}.</p>'
+        + (f'<p>For this flat: {earned_example}.</p>' if flat else '') + '</div>'
+        '<details class="hw-score-method"><summary>Why these weights and maximum scores?</summary>'
+        '<p>The app starts with <strong>preassigned default weights</strong> for each category. '
+        'You can adjust these using the sliders or load weights from a saved profile. '
+        'Weights represent your priorities and are not calculated from flat data. '
+        'Each category’s maximum points equal its weight divided by the total weight, '
+        'multiplied by 100. Equal weights receive equal maximum points.</p>'
+        f'<dl>{"".join(reasons)}</dl>'
+        '<p>Each metric receives a 0–100 percentile score against sales in your selected '
+        'period, before other search filters are applied. Affordability compares the same '
+        'flat type. Missing metric data earns 0. Weight 0 excludes a category.</p>'
+        '<p>Earned points = percentile score × weight ÷ total weight. '
+        'The total uses contributions before display rounding; the backend rounds it to '
+        'one decimal place and the headline displays a whole number. Rounded rows may '
+        'not add up exactly to the displayed total.</p></details></section>'
     )
-    bars = base.mark_bar(color=BRAND, cornerRadiusEnd=5, size=20)
-    labels = base.mark_text(align="left", dx=5, color=LABEL_GREY, fontSize=12,
-                            fontWeight=600).encode(text=alt.Text("points:Q", format=".1f"))
-    return (bars + labels).properties(height=34 * len(active) + 30,
-                                     padding={"left": 5, "right": 40, "top": 5, "bottom": 5})
-
-
 
 SINGAPORE_VIEW = pdk.ViewState(latitude=1.3521, longitude=103.8198, zoom=10.3)
 
@@ -447,14 +534,7 @@ def _ff_results(ctx: Ctx, user: str | None, shortlist: list, saved_ids: set):
                            f"{r['storey_range']} · {r['floor_area_sqm']:.0f} sqm · sold "
                            f"{pd.Timestamp(r['month']):%b %Y} for ${r['resale_price']:,.0f}")
                 active = [k for k in FACTORS if weights.get(k, 0) > 0]
-                st.altair_chart(_ff_contrib_chart(r, weights, active), width="stretch")
-                st.caption("Each bar is sub-score × your weight ÷ total weight, "
-                           "so the bars add up to the score.")
-                st.markdown("\n".join(f"- {_ff_explain(k, r)} (weight {weights[k]})"
-                                      for k in active))
-                ignored = [FACTORS[k][0] for k in FACTORS if weights.get(k, 0) == 0]
-                if ignored:
-                    st.caption("Not counted (weight 0): " + ", ".join(ignored))
+                st.html(_ff_score_chart(weights, r))
                 tid = str(r["transaction_id"])
                 with st.container(border=True):
                     _ff_price_check(ctx, r, res.setdefault("pc", {}))
@@ -784,6 +864,9 @@ def render(ctx: Ctx):
                 if user:
                     top_ids = df["transaction_id"].head(5).tolist() if len(df) else []
                     record(prefs.log_search(user, weights, filters, len(df), top_ids))
+
+    with st.expander("Your scoring priorities", expanded=not bool(ss.get("ff_result"))):
+        st.html(_ff_score_chart(_ff_weights()))
 
     _ff_results(ctx, user, shortlist, saved_ids)
     _ff_saved(ctx, user, shortlist)

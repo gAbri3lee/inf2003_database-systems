@@ -35,6 +35,11 @@ class ScoringGuiTests(unittest.TestCase):
             stack.enter_context(patch.object(PgRepo, 'distinct', return_value=['TEST TOWN']))
             stack.enter_context(patch.object(MongoRepo, 'ping', side_effect=RuntimeError('offline')))
             stack.enter_context(patch.object(MongoRepo, 'distinct', return_value=[]))
+            # Price-check data is external to this scoring-presentation test.
+            stack.enter_context(patch.object(MongoRepo, 'price_check', return_value=(
+                dict(status='not_enough', comparable_count=0, tried=[],
+                     message='No comparable sales in this test fixture.'),
+                Timing(label='price check', engine='mongodb'), '[]')))
             stack.enter_context(patch.object(PgRepo, 'score_flats', create=True,
                 return_value=([row], Timing(label='compatibility score', engine='postgres'), 'SELECT 1')))
             app = AppTest.from_file(str(Path(__file__).parents[1] / 'app.py'), default_timeout=20).run()
@@ -42,6 +47,9 @@ class ScoringGuiTests(unittest.TestCase):
             self.assertEqual(len(app.tabs), 8)
             self.assertEqual(len([widget for widget in app.slider if (widget.key or '').startswith('ff_w_')]), 7)
             self.assertFalse(any(toggle.key == 'ff_match_enabled' for toggle in app.toggle))
+            overview = '\n'.join(item.proto.body for item in app.get('html')
+                                 if 'class="hw-score-chart"' in item.proto.body)
+            self.assertIn('Affordability: weight 70; maximum 22.6 points', overview)
             app.button(key='ff_find').click().run()
             self.assertFalse(list(app.exception))
             self.assertFalse(list(app.error))
@@ -55,9 +63,20 @@ class ScoringGuiTests(unittest.TestCase):
             self.assertRegex(cards, r'School 98 m · <i[^>]*>.*?</i> ~2 min')
             self.assertNotIn('&#xe000;', cards)
             self.assertTrue(any('Why #1 scored 77 / 100' in item.value for item in app.markdown))
-            self.assertEqual(len(app.get('vega_lite_chart')), 1)
+            charts = [item.proto.body for item in app.get('html')
+                      if 'class="hw-score-chart"' in item.proto.body]
+            self.assertEqual(len(charts), 2)
+            self.assertIn('Affordability: earned 17.4 of 22.6 points; weight 70', charts[-1])
+            self.assertIn('MRT access: earned 14.9 of 19.4 points; weight 60', charts[-1])
             self.assertFalse(any(expander.label == 'View all factor details' for expander in app.expander))
-            self.assertTrue(any('Each bar is sub-score' in item.value for item in app.caption))
+            self.assertIn('percentile score × weight ÷ total weight', charts[-1])
+            # Unsaved slider edits update the overview, not the previous search's breakdown.
+            app.slider(key='ff_w_afford').set_value(0)
+            app.run()
+            charts = [item.proto.body for item in app.get('html')
+                      if 'class="hw-score-chart"' in item.proto.body]
+            self.assertIn('Affordability: excluded; weight 0', charts[0])
+            self.assertIn('Affordability: earned 17.4 of 22.6 points; weight 70', charts[-1])
             for factor in FACTORS:
                 app.slider(key='ff_w_'+factor).set_value(0)
             app.run()
